@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Data files (sensitive/large)
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+
+# KNIME workflow files
+*.knwf
+*.knar
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Documentation folder (Cursor conversation exports)
+Documentation/
+
+# Attribute Editor test data
+Attribute Editor/
+
+# Terminals folder (Cursor IDE)
+terminals/
+
+# GitHub agent init prompt (internal use only)
+GITHUB_AGENT_INIT_PROMPT.md

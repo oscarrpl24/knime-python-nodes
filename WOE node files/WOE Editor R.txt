@@ -1,0 +1,1039 @@
+################################# WOE Editor ############################################
+# WOE Editor for Knime node
+# Release Date: 02-28-2022
+# Version : 1.0
+#########################################################################################
+
+
+df <- data.frame(knime.in, check.names = TRUE)
+
+# source("D:/CheckCity/Projects/global-function.R")
+
+minProp <- 0.01
+
+#install.packages("shiny")
+#install.packages("future")
+#install.packages("shinydashboard")
+#install.packages("plotly")
+#install.packages("logiBin")
+#install.packages("DT")
+#install.packages("shinyjs")
+#install.packages("data.table")
+#install.packages("tidyverse")
+#install.packages("shinyalert")
+#install.packages("nsprcomp")
+#install.packages("plyr")
+#install.packages("shinycssloaders")
+#install.packages("shinybusy")
+
+library(plyr)
+library(shiny)
+library(future)
+library(shinydashboard)
+library(plotly)
+library(logiBin)
+library(DT)
+library(shinyjs)
+library(data.table)
+library(tidyverse)
+library(shinyalert)
+library(nsprcomp)
+
+library(shinycssloaders)
+library(shinybusy)
+
+# Custom Function
+  # Calculate WOE
+  calculateWOE <- function(freq_good, freq_bad) {
+    woe <- round(log((freq_bad / sum(freq_bad)) / (freq_good / sum(freq_good))), 5)
+    return(woe)
+  }
+  
+  # Update Bins
+  updateDiscreteBins <- function(var, rules, bads, goods)
+  {
+    iv<- data.frame(cbind(var=var, bin=rules, count=NA, bads=bads, goods=goods, propn=NA, bad_rate=NA, iv=NA, ent=NA), stringsAsFactors = F)
+    iv$bads <- as.numeric(as.character(iv$bads))
+    iv$goods <- as.numeric(as.character(iv$goods))
+    iv$count <- iv$goods + iv$bads
+    iv$propn <- round(iv$count/sum(iv$count)*100, 2)
+    iv$goodCap <- iv$goods/sum(iv$goods)
+    iv$badCap <- iv$bads/sum(iv$bads)
+    iv$iv <- round((iv$goodCap - iv$badCap)*(log(iv$goodCap/iv$badCap)),4)
+    iv$ent <- ifelse(iv$bads == 0 | iv$goods == 0, 0, round(-1*((iv$bads/iv$count*log2(iv$bads/iv$count))+(iv$goods/iv$count*log2(iv$goods/iv$count))), 4))
+    iv$purNode <- ifelse(iv$bads == 0 | iv$goods == 0, "Y", "N")
+    for(i in 2:length(rules))
+    {
+      if(!grepl("^is.na{1}",iv[i, "bin"]))
+        if(iv[i, "bads"]/iv[i, "count"] >= iv[i-1, "bads"]/iv[i-1, "count"])
+          iv[i, "trend"] <- "I"
+        else
+          iv[i, "trend"] <- "D"
+    }
+    iv[nrow(iv)+1, "var"]<- var
+    iv[nrow(iv),"bin"] <- "Total"
+    iv[nrow(iv),"count"] <- sum(iv$count, na.rm = T)
+    iv[nrow(iv),"goods"] <- sum(iv$goods, na.rm = T)
+    iv[nrow(iv),"bads"] <- sum(iv$bads, na.rm = T)
+    iv[nrow(iv),"iv"] <- round(sum(iv$iv*is.finite(iv$iv), na.rm = T),4)  #Multiply by isFinite to remove Inf from sum as Inf*0 = NaN whih is excluded using na.rm = T
+    iv[nrow(iv),"ent"] <- round(sum(iv$ent*iv$count/iv[nrow(iv),"count"], na.rm = T),4)
+    iv$bad_rate <- round(iv$bads/iv$count*100,2)
+    iv[nrow(iv), "monTrend"] <- ifelse(length(unique(iv[!is.na(iv$trend), "trend"])) > 1 , "N", "Y")
+    iv[nrow(iv), "flipRatio"] <- min(nrow(iv[!(is.na(iv$trend)) & iv$trend == 'I',]), nrow(iv[!(is.na(iv$trend)) & iv$trend == 'D',]))/(nrow(iv)-2)
+    iv[nrow(iv), "numBins"] <- nrow(iv)-1
+    iv[nrow(iv), "trend"] <-  ifelse(nrow(iv[iv$trend == 'I',]) >= nrow(iv[iv$trend== 'D',]) , "I", "D")
+    iv[nrow(iv), "purNode"] <- ifelse(nrow(iv[!(is.na(iv$purNode)) & iv$purNode == 'Y',])> 0, "Y", "N")
+    iv[nrow(iv),c("propn","goodCap","badCap")] <- 1
+    return(iv)
+  }
+  
+  manualDiscreteSplit <- function(binObj, splitVar, y, splits, df, action)
+  {
+    
+    if(action == "BreakBin"){
+      splits <- sort(splits)
+    }
+    rules <- numeric()
+    cGoods <- numeric()
+    cBads <- numeric()
+    df <- as.data.table(df)
+    for(i in 1:length(splits))
+    {
+      if(binObj[["varSummary"]]$varType == "numeric"){
+        rules[i] <- paste(splitVar," == ", "'",  splits[i], "'", sep = "")
+      }else if(binObj[["varSummary"]]$varType == "factor"){
+        if(action == "BreakBin"){
+          rules[i] <- paste0(splitVar, " %in% c(", paste0('\"', splits[i], '\"', collapse = ","), ")")
+        }else{
+          rules[i] <- paste0(splitVar, " %in% c(", paste0('\"', unique(splits[[i]]), '\"', collapse = ","), ")")
+        }
+      }
+      
+      d1<-subset(df,eval(parse(text=rules[i])))
+      if(nrow(d1) > 0)
+      {
+        cBads[i]<- sum(d1[[y]])
+        cGoods[i]<- nrow(d1) - cBads[i]
+      }
+    }
+    if (sum(is.na(df[[splitVar]])) > 0){
+      rules[length(rules)+1]<- paste0("is.na(", splitVar,")")
+      cBads[length(cBads)+1]<- sum(df[is.na(get(splitVar)), get(y)])
+      cGoods[length(cGoods)+1] <- sum(is.na(df[, splitVar, with = F])) - cBads[length(cBads)]
+    }
+    iv<- updateDiscreteBins(splitVar, rules, cBads, cGoods)
+    binObj$varSummary[binObj$varSummary$var==splitVar, "iv"] <- iv[nrow(iv), "iv"]
+    binObj$varSummary[binObj$varSummary$var==splitVar, "ent"] <- iv[nrow(iv), "ent"]
+    binObj$varSummary[binObj$varSummary$var==splitVar, "trend"] <- iv[nrow(iv), "trend"]
+    binObj$varSummary[binObj$varSummary$var==splitVar, "monTrend"] <- iv[nrow(iv), "monTrend"]
+    binObj$varSummary[binObj$varSummary$var==splitVar, "flipRatio"] <- iv[nrow(iv), "flipRatio"]
+    binObj$varSummary[binObj$varSummary$var==splitVar, "numBins"] <- iv[nrow(iv), "numBins"]
+    binObj$varSummary[binObj$varSummary$var==splitVar, "purNode"] <- iv[nrow(iv), "purNode"]
+    binObj$bin <- binObj$bin[binObj$bin$var != splitVar,]
+    binObj$bin <- rbind(binObj$bin, iv[,1:9])
+    return(binObj)
+  }
+  
+  # create modified bins
+  createModifiedBins <- function(bins, df, xVars, prefix= "b_")
+  {
+    df <- as.data.table(df)
+    for(i in 1:length(xVars))
+    {
+      rules <- bins[bins$var == xVars[i] & bins$bin != 'Total',"bin"]
+      df[,paste0(prefix, xVars[i])] <- NA
+      naRule <- NULL
+      for(j in 1:length(rules))
+      {
+        df[,paste0(prefix, xVars[i])] <- with(df, ifelse(eval(parse(text=rules[j])), gsub(" %in% c", "", gsub(xVars[i], "", rules[j])), get(df[,paste0(prefix, xVars[i])])))
+        if(grepl("\\| is.na", rules[j]))
+          naRule <- gsub(xVars[i], "", rules[j])
+      }
+      if(!is.null(naRule))
+        df[,paste0(prefix, xVars[i])] <- with(df, ifelse(is.na(df[[xVars[i]]]), naRule, get(df[,paste0(prefix, xVars[i])])))
+    }
+    return(as.data.frame(df))
+  }
+    createNewBins <- function(binObj, df, xVars, prefix= "b_")
+  {
+    df <- as.data.table(df)
+    for(i in 1:length(xVars))
+    {
+      rules <- binObj$bin[binObj$bin$var == xVars[i] & binObj$bin$bin != 'Total',"bin"]
+      df[,paste0(prefix, xVars[i])] <- NA
+      naRule <- NULL
+      for(j in 1:length(rules))
+      {
+        df[,paste0(prefix, xVars[i])] <- with(df, ifelse(eval(parse(text=rules[j])), gsub(" %in% c", "", gsub(xVars[i], "", rules[j])), get(df[,paste0(prefix, xVars[i])])))
+        if(grepl("\\| is.na", rules[j]))
+          naRule <- gsub(" %in% c", "", gsub(xVars[i], "", rules[j]))
+      }
+      if(!is.null(naRule))
+        df[,paste0(prefix, xVars[i])] <- with(df, ifelse(is.na(df[[xVars[i]]]), naRule, get(df[,paste0(prefix, xVars[i])])))
+    }
+    return(as.data.frame(df))
+  }
+  # Predictive Measures
+  # Entropy
+  entropy <- function(probs) 
+  {
+    if(!any(is.na(probs))){
+      if (any(probs == 0)) {
+        probs[probs == 0] <- NA # 0.0000000001
+      }
+    }
+    output <- NA
+    for (i in 1:length(probs)) {
+      output[i] <- probs[i]*log2(probs[i])
+    }
+    output <- sum(output) * -1
+    return(output)
+  }
+  # Input Entropy Function
+  inputEntropy <- function(df) 
+  {
+    total0 <- df$goods[length(df$goods)]
+    total1 <- df$bads[length(df$bads)]
+    total <- total0 + total1
+    probs <- c(total0 / total, total1 / total)
+    output <- entropy(probs = probs)
+    return(round(output, 5))
+  }
+  # Output Entropy Function
+  outputEntropy <- function(df) 
+  {
+    probs0 <- (df$goods / df$count)[1:length(df$goods)-1]
+    probs1 <- (df$bads / df$count)[1:length(df$bads)-1]
+    probs <- data.frame(probs0, probs1)
+    ent <- NA
+    for (i in 1:length(probs0)) {
+      p <- unlist(probs[i,])
+      ent[i] <- entropy(p)
+    }
+    total <- df$count[length(df$count)]
+    prop <- df$count[1:length(df$count)-1] / total
+    output <- sum(prop * ent)
+    return(round(output,5))
+  }
+  # Gini Core Function
+  gini <- function(totals, overalltotal) {
+    output <- 1 - (sum(totals ^ 2) / (overalltotal ^ 2))
+    return(output)
+  }
+  # Input Gini Function
+  inputGini <- function(df) {
+    totals <- c(df$goods[length(df$goods)], df$bads[length(df$bads)])
+    overtotal <- df$count[length(df$count)]
+    output <- gini(totals, overtotal)
+    return(round(output,5))
+  }
+  # Output Gini Function
+  outputGini <- function(df) {
+    totals0 <- df$goods[1:length(df$goods)-1]
+    totals1 <- df$bads[1:length(df$bads)-1]
+    totals <- df$count[1:length(df$count)-1]
+    alltotals <- data.frame(totals0, totals1)
+    gi <- vector()
+    for (i in 1:length(totals0)) {
+      gi[i] <- gini(unlist(alltotals[i,]), totals[i])
+    }
+    output <- sum(gi * (totals / sum(totals)))
+    return(round(output,5))
+  }
+  
+  
+  previous_element <- function(var, vars){
+    i <- match(var, vars)
+    previous_element <- vars[i - 1]
+    return(previous_element)
+  }
+  
+  next_element <- function(var, vars){
+    i <- match(var, vars)
+    next_var <- vars[i + 1]
+    return(next_var)
+  }
+
+  filterBin <- function(selectedVar, bins){
+  	return(filter(bins, var == selectedVar))
+  }
+
+
+#Initializing Check Variables
+ContainsDV <- FALSE
+ContainsTC <- FALSE
+ContainsOptimizeAll <- FALSE
+ContainsGroupNA <- FALSE
+
+#Attempting to assign Flow Variables
+try({DV <- knime.flow.in[["DependentVariable"]]})
+try({Target <- knime.flow.in[["TargetCategory"]]})
+try({OptimizeAll <- knime.flow.in[["OptimizeAll"]]})
+try({GroupNA <- knime.flow.in[["GroupNA"]]})
+
+#DependentVariable
+if (!is.null(DV) & (typeof(DV) == "character" & length(DV) == 1)) {
+  if (!is.na(DV) & DV != "missing") {
+    ContainsDV <- TRUE
+  }
+}
+
+#TargetCategory
+if (!is.null(DV) & !is.null(Target)) {
+  if (Target %in% unique(df[DV])){
+      ContainsTC <- TRUE 
+  }
+}
+
+#OptimizedAll
+if (!is.null(OptimizeAll)) {
+  ContainsOptimizeAll <- TRUE 
+}
+
+#GroupNA
+if (!is.null(GroupNA)) {
+    ContainsGroupNA <- TRUE 
+}
+
+
+#Checks whether to use Rshiny app or "Headless" Calculation
+if (ContainsDV == TRUE) {
+
+	IV <- colnames(df)
+     IV <- IV[!IV %in% DV]
+	# get bins
+#######################################################################################################
+#######################################################################################################
+#######################################################################################################
+#######################################################################################################
+#######################################################################################################
+#######################################################################################################
+
+#	Bins <- getBins(df,as.data.frame(t(DV)), as.data.frame(t(IV))  , minProp = minProp)	
+#	Bins <- getBins(df,as.data.frame(DV), as.data.frame(IV)  , minProp = minProp)
+#	Bins <- getBins(df,"IsBad", c('GrossPay', 'DirectDeposit', 'PayFreq', 'CAA.EXP.TRTR3624')  , minProp = minProp)
+	Bins <- getBins(df,DV, IV  , minProp = minProp)
+#######################################################################################################
+#######################################################################################################
+#######################################################################################################
+#######################################################################################################
+#######################################################################################################
+#######################################################################################################
+
+	# GROUP NA 
+	if (ContainsGroupNA){
+		print(1)
+	}
+
+	# Optimize ALL
+	if (ContainsOptimizeAll){
+
+    		Bins_mod <- naCombine(Bins, Bins[["varSummary"]]$var)
+	 # decreasing trend
+	  decr_var <- filter(Bins_mod[["varSummary"]], trend == "D")
+	  if(nrow(decr_var) >= 1){
+	    	Bins_mod <- forceDecrTrend(Bins_mod, decr_var$var)
+	  }
+      # increasing trend 
+    	  incr_var <- filter(Bins_mod[["varSummary"]], trend == "I")
+    	  if(nrow(incr_var) >= 1){
+    		Bins_mod <- forceIncrTrend(Bins_mod, incr_var$var)
+    	  }
+	}
+	# print("Bins_mod")
+	# values$all_iv_vars <- values$bins_vars
+    
+    #    if(!is.null(values$modified_bins)){
+    #      values$df_withBins <- cbind(values$df_withBins, values$df_withModifiedBins)
+    #     }
+   #  rules <- values$all_bins$bin[values$all_bins$bin$bin != 'Total', ]
+
+ 	rules <- Bins_mod$bin[Bins_mod$bin$bin != 'Total',]
+     rules$woe <- calculateWOE(rules$goods, rules$bads)
+    
+    for (i in 1:length(Bins_mod[["varSummary"]]$var)){
+      for(j in 1:nrow(rules)){
+        if(rules$var[j] == Bins_mod[["varSummary"]]$var[i]){
+          rules[j, 'binValue'] <- gsub(" %in% c", "", gsub(Bins_mod[["varSummary"]]$var[i], "", rules$bin[j]))
+        }
+      }
+    }
+
+
+    # saveRDS(rules, "bins.RDS")
+    createBins <- createNewBins(Bins_mod, df, Bins_mod[["varSummary"]]$var)
+    #print(createBins)
+
+   for(i in 1:length(Bins_mod[["varSummary"]]$var)){
+
+	 x <- paste0('b_', Bins_mod[["varSummary"]]$var[i])
+	 rule_temp <- rules[rules$var == Bins_mod[["varSummary"]]$var[i], c("binValue","woe")]
+	 names(rule_temp)[names(rule_temp) == 'binValue'] <- x
+	 createBins <- plyr::join(createBins, 
+	      				rule_temp, 
+	      				type = "left",
+	      				by = paste0(x)
+	      				)
+     names(createBins)[names(createBins) == 'woe'] <- paste0('WOE_', Bins_mod[["varSummary"]]$var[i])
+    }
+	print(colnames(createBins))
+	df_with_woe <- createBins
+     #saveRDS(createBins, "df_iv_all.RDS")
+
+	
+	# df_with_woe <- readRDS('df_iv_all.RDS')
+	# bins <- readRDS('bins.RDS')
+	bins <- rules
+	DV <- knime.flow.in[["DependentVariable"]]
+	df_only_woe <- df_with_woe[, grep("WOE_", colnames(df_with_woe))]
+	df_only_woe[, DV] <- df_with_woe[DV]
+	
+  
+} else {
+  options(spinner.color="#0275D8", spinner.color.background="#ffffff", spinner.size=2)
+
+ui <- fluidPage(
+  useShinyalert(),  # Set up shinyalert
+  
+  tags$head(  #GLOBAL CSS
+    # Note the wrapping of the string in HTML()
+    tags$style(HTML("
+      @import url('https://fonts.googleapis.com/css?family=Raleway');
+      body {
+        border-color: #ecf0f1;
+       # font-family: 'Raleway'
+      }
+      .divider {
+    		width: 20px;
+    		height: 40px;
+    		display: inline-block;
+    		color: white;
+			}
+	.divider2 {
+    		width: 20px;
+    		height: 20px;
+    		display: inline-block;
+    		color: white;
+			}
+	.btn {
+		font-weight: bold;
+		border-radius: 100px;
+		font-family: 'Raleway';
+		}
+	.legend
+	{
+		font-family: 'Raleway'
+	}
+	.g-title
+	{
+		font-family: 'Raleway'
+	}
+      h4 {
+        font-weight: bold;
+        font-size: 24px;
+      }
+      .shiny-input-container {
+        color: #474747;
+      }"))
+  ),
+  
+  fluidRow(
+    style = 'border-color: #ffffff; border-style: solid; margin-left: 0px; margin-right: 0px; margin-bottom: 20px; padding-top: 5px; margin-top: 20px',
+    tags$header(
+      class = "col-sm-12 title-panel",
+      tags$h4("WOE Editor", style="text-align:center;"),
+    )
+  ),
+  fluidRow(
+    style = 'border-color: #bdc3c7; padding-top: 5px; margin-top:20px; margin-right: 0px; margin-left: 0px; border-top: solid; border-right: solid; border-left: solid; border-color: #ecf0f1',
+    box(
+      width = 6,
+      selectInput("DV", label = "Dependent Variable", 
+                  choices = colnames(df), selected = df[,1]),
+    ),
+    box(
+      width = 6,
+      selectInput("TC", label = "Target Category", choices = NULL),
+    ),
+  ),
+  # WOE Editor for Each Variable
+  fluidRow(
+    style = 'padding-bottom: 20px; margin-right: 0px; margin-left: 0px; margin-bottom: 20px; border-right: solid; border-left: solid; border-bottom: solid; border-color: #ecf0f1',
+    box(
+      
+      width = 6,
+      selectInput("IV", label = "Independent Variable", choices = NULL, selected = df[,1]),
+      actionButton("Previous", "Previous" , icon("arrow-left"), style="color: #fff; background-color: #8A9399; border-color: #ecf0f1"),
+      actionButton("Next", "Next" , icon("arrow-right"), style="color: #fff; background-color: #9ECC53; border-color: #ecf0f1"),
+    ),
+    box(
+      width = 6,
+      actionButton("GroupBin", "Group Bins" , icon("object-group"), style="color: #fff; background-color: #75AFD7; border-color: #ecf0f1"),
+      actionButton("GroupNABin", "Group NA Bins", icon("object-group"), style="color: #fff; background-color: #75AFD7; border-color: #ecf0f1"),
+      actionButton("BreakBin", "Break Bin" , icon("object-ungroup"), style="color: #fff; background-color: #B5202E; border-color: #ecf0f1"),
+      actionButton("ResetBin", "Reset Bins", icon("refresh"), style="color: #fff; background-color: #B5202E; border-color: #ecf0f1"),
+      actionButton("Optimize", "Optimize Bins", icon("cube"), style="color: #fff; background-color: #525E66; border-color: #ecf0f1"),
+      actionButton("OptimizeAll", "Optimize All Bins", icon("cubes"), style="color: #fff; background-color: #525E66; border-color: #ecf0f1"),
+      tags$div(class = "divider", tags$p(".")),
+      textInput("ManualSplit", "Manual Splits", value = NULL, placeholder = "Splits separated by comma"),
+      actionButton("ManualBin", "Manual Bins", icon("edit"), style="color: #fff; background-color: #75AFD7; border-color: #ecf0f1")
+      
+    ),
+  ),
+  fluidRow(
+    style = 'border-color: #ecf0f1',
+    box( width = 6,
+         column(width = 12,
+                withSpinner(DT::dataTableOutput("WOE_TABLE"), type=1), style = "background-color: white; padding: 10px; border-style: solid; height:500px; overflow-y: scroll;overflow-x: scroll; border-color: #ecf0f1"
+                #DT::dataTableOutput("WOE_TABLE"), style = "background-color: white; padding: 10px; border-style: solid; height:500px;"
+         )
+    ),
+    box( width = 6,
+         column(width = 12,
+                withSpinner(plotlyOutput("WOEGraph"), type=1), style = "background-color: white; padding: 10px; border-style: solid; height:500px; border-color: #ecf0f1 "
+         )
+    )
+  ),
+  fluidRow(
+    style = 'margin-top: 20px',
+    box(
+      style = 'border-style: solid; border-color: #ecf0f1;',
+      width = 6,
+      withSpinner(plotOutput("WOEBarGraph"), type=1)
+    ),
+    box(
+      style = 'border-style: solid; border-color: #ecf0f1;',
+      width = 6,
+      withSpinner(plotOutput("PropGraph"), type=1)
+    )
+  ),
+  tags$div(class = "divider2", tags$p(".")),
+  fluidRow(
+    box (
+      width = 6,
+      DT::dataTableOutput("Measurement_Table"), 
+      style = "background-color: white; padding: 10px; border-style: solid; height:100px; margin-top: 20px; border-color: #ecf0f1"
+    )
+  ),
+  
+  fluidRow(
+    style = 'padding-top: 20px; padding-bottom: 20px; margin-left: 0px; margin-right: 0px; margin-top: 20px; border-style: solid; border-color: #ecf0f1',
+    column(12,
+           actionButton("Update", "Update", icon("save"), style="color: #fff; background-color: #75AFD7; border-color: #ecf0f1"),
+           actionButton("Run", "Run", icon("caret-square-right"), onclick = "setTimeout(function(){window.close();},1500);", 
+                        style="color: #fff; background-color: #9ECC53; border-color: #ecf0f1"),
+           #	actionButton("Submit", "Submit", onclick = "setTimeout(function(){window.close();},500);", icon("paper-plane"), 
+           #		style="color: #fff; background-color: #337ab7; border-color: #2e6da4"),
+           align = 'center'
+    )
+  )
+)
+
+server <- function(session, input, output) {
+  
+  # STOP App On Session End
+  session$onSessionEnded(function() { 
+    stopApp() 
+  })
+  
+  #      # Stop App and Close Window on submit
+  #	observe({
+  #		if (input$Submit > 0) {stopApp()}
+  #	})
+
+
+  
+  
+  # Initialize Values Variable
+  values <- reactiveValues()
+
+  values$ModifiedAction <- FALSE
+  observe({
+    values$df <- df
+  })
+  
+  # Update DV and IV based on selection
+  observeEvent(input$DV, {
+    saveRDS(input$DV , "DV.RDS")
+    if(is.factor(df[, input$DV]) & length(unique(df[,input$DV])) > 2 ){
+      message <- "Selected dependent variable is non binary factors."
+      shinyalert("Opps!", message, type = "info")
+    }
+    else if(all(is.na(df[, input$DV])) | all(is.null(df[, input$DV]))){
+      message <- "Selected dependent variable is NA or Null."
+      shinyalert("Opps!", message, type = "info")
+    }
+    else{
+      values$IV <- colnames(df)
+      values$IV <- values$IV[!values$IV %in% input$DV]
+      if (sum(is.na(df[input$DV])) <= 0){
+      	values$all_Bins <-  getBins(df, input$DV, values$IV , minProp = minProp)
+      	values$bins_vars <- values$all_Bins[["varSummary"]]$var
+      
+      	# values$IV <- colnames(df[, !names(df) %in% input$DV])
+      	updateSelectInput(session, "IV", label = "Independent Variable",
+                        # choices = colnames(df[, !names(df) %in% input$DV])
+                        choices = values$bins_vars
+      	)
+      	updateSelectInput(session, "TC", label = "Target Category",
+                        choices = unique(df[,input$DV]), selected = max(unique(df[,input$DV]))
+      	)
+      }else{
+      	values$all_Bins <- NULL
+      	values$Bins <- NULL
+      	message <- "Selected dependent variable has NA or Null."
+      	shinyalert("Opps!", message, type = "info")
+      	}
+
+    }
+  })
+  observeEvent(input$TC, {
+    if(is.factor(df[, input$DV]) & length(unique(df[,input$DV])) > 2 ){
+    }else{
+      if(input$TC != max(unique(values$df[,input$DV]))){
+        values$df[, input$DV][values$df[, input$DV] == 0] <- 2
+        values$df[, input$DV][values$df[, input$DV] == 1] <- 0
+        values$df[, input$DV][values$df[, input$DV] == 2] <- 1
+        values$initialBins<- values$Bins <- getBins(values$df, input$DV, input$IV, minProp = minProp)
+      }
+      else{
+        values$df <- df	
+        values$initialBins<- values$Bins <- getBins(values$df, input$DV, input$IV, minProp = minProp)
+      } 
+    }
+  })
+  
+  observeEvent(input$Previous, {
+    values$previous <- previous_element(input$IV, values$bins_vars)
+    if(length(values$previous) >= 1){
+      if(is.null(values$bins_vars)){
+        updateSelectInput(session, "IV", label = "Independent Variable",
+                          choices = values$bins_vars, selected = values$previous
+        )
+      }
+
+      else{
+        updateSelectInput(session, "IV", label = "Independent Variable",
+                          choices = values$bins_vars, selected = values$previous
+        )
+      }
+    }
+    else{shinyalert("Opps!", "No Previous variable")}
+  })
+  observeEvent(input$Next, {
+    values$next_var <- next_element(input$IV, values$bins_vars)
+    if(!is.na(values$next_var)){
+      updateSelectInput(session, "IV", label = "Independent Variable",
+                        choices = values$bins_vars, selected = values$next_var
+      )
+    }
+    else{shinyalert("Opps!", "No Next variable")}
+    
+  })
+  
+  # Generate Bins
+  observeEvent(input$IV,{
+    if(input$DV == "" | input$IV == ""){
+      
+    }
+    else if(all(is.na(df[,input$IV]))){
+      message <- "Selected Independent variable is NA."
+      shinyalert("Opps!", message, type = "info")
+    }
+    else{
+      values$initialBins<- values$Bins <- getBins(values$df, input$DV, input$IV, minProp = minProp)
+    }
+  })
+  
+  # Group Bin
+  observeEvent(input$GroupBin, {
+    selected_bins_index <- input$WOE_TABLE_rows_selected
+    if(length(selected_bins_index) <= 1 | is.null(selected_bins_index)){
+      message <- "Please select at least two bins to combine."
+      shinyalert("Oops!",message, type = "info")
+    }
+    else if (length(selected_bins_index) >= length(values$Bins$bin$bin)-2) {
+      message <- "At least two splits should be specified"
+      shinyalert("Oops!", message, type = "info")
+    }
+    else{
+      Bins <- values$Bins
+      Bins_tbl <- Bins[["bin"]]
+      varType <- Bins[["varSummary"]]$varType[Bins[["varSummary"]]$var == input$IV]
+      if(varType == "numeric"){
+        # function to get numeric 
+        get_numeric <- function(bin){
+          numeric_split <- suppressWarnings(as.numeric(gsub("'", "", sub('.*=','', bin))))
+          numeric_split <- numeric_split[!is.na(numeric_split)]
+          return(numeric_split)
+        }
+        combine_split_bin <- as.vector(Bins_tbl$bin[selected_bins_index])
+        selected_split <- get_numeric(combine_split_bin)
+        keep_split <- max(selected_split)
+        
+        # get all splits
+        all_splits <- get_numeric(Bins_tbl$bin)
+        # remove splits 
+        remove_splits <- setdiff(selected_split, keep_split)
+        new_splits <- as.numeric(setdiff(all_splits, remove_splits))
+        values$Bins <- manualSplit(Bins, input$IV, input$DV, new_splits ,df)
+      }
+      else if(varType == "factor"){
+        get_discrete_splits <- function(bins){
+          discrete_split <- as.vector(gsub("[\"()]", "",sub('.*%in% c','', bins)))
+          return(discrete_split)
+        }
+        combine_split_bin <- as.vector(Bins_tbl$bin[selected_bins_index])
+        combine_split <- list(get_discrete_splits(Bins_tbl$bin[selected_bins_index]))
+        non_combine_splits <- Bins_tbl$bin[-selected_bins_index]
+        non_combine_splits <- non_combine_splits[!grepl('is.na{1}', non_combine_splits)]
+        non_combine_splits <- get_discrete_splits(non_combine_splits)
+        non_combine_splits <- unlist(setdiff(non_combine_splits, "Total"))
+        new_splits<- append(combine_split, non_combine_splits)
+        values$Bins <- manualDiscreteSplit(Bins, input$IV, input$DV, new_splits ,df, "GroupBin")
+      }
+      else{
+        
+      } 
+    }
+  })
+  #Group NA Bin
+  observeEvent(input$GroupNABin, {
+    Bins <- values$Bins
+    values$Bins <- naCombine(Bins, input$IV)
+  })
+  
+  # Break Bin
+  observeEvent(input$BreakBin, {
+    Bins <- values$Bins
+    splits <- unique(df[,input$IV])
+    splited_bins <- manualDiscreteSplit(Bins, input$IV, input$DV, splits ,df, "BreakBin")
+    values$Bins <- splited_bins
+  })
+  
+  # Break Bin
+  observeEvent(input$ManualBin, {
+    Bins <- values$Bins
+    Bins_tbl <- Bins[["bin"]]
+    varType <- Bins[["varSummary"]]$varType[Bins[["varSummary"]]$var == input$IV]
+    if(varType == "numeric"){
+      manual_splits <- as.numeric(unlist(as.list(strsplit(input$ManualSplit, ",")[[1]])))
+      print((max(manual_splits) > max(df[, input$IV])))
+      if (length(manual_splits) <= 1) {
+        message <- "Need to input at least 2 values."
+        shinyalert("Oops!", message, type = "info")
+      }
+      #		     else if((max(manual_splits) > max(df[, input$IV])) | 
+      #		     	   (min(manual_splits) < min(df[, input$IV]))) {
+      #		     	message <- "Split is outside the range of variable data."
+      #		        	shinyalert("Oops!", message, type = "info")
+      #		     }
+      else{
+        values$Bins <- manualSplit(Bins, input$IV, input$DV, manual_splits ,df)
+      }
+      
+    }
+    else if(varType == "factor"){
+      
+    }
+    else {
+      message <- "Independent Variable is niether numeric nor factor."
+      shinyalert("Oops!", message, type = "info") 
+    }
+  })
+  # Reset Bin
+  observeEvent(input$ResetBin, {
+  	values$ModifiedAction <- FALSE
+#    Bins <- values$Bins
+#    reset_bins <- getBins(df, input$DV, input$IV, minProp = minProp)
+#    values$Bins <- reset_bins
+  })
+  # Optimize Bins
+  observeEvent(input$Optimize, {
+  	if(values$ModifiedAction){
+		values$ModifiedAction <- FALSE
+  	}
+
+    Bins <- values$Bins
+    trend <- Bins[["varSummary"]]$trend[Bins[["varSummary"]]$var == input$IV]
+    if(trend == "I"){
+      Bins <- forceIncrTrend(Bins, Bins[["varSummary"]]$var)
+    }
+    else if (trend == "D"){
+      Bins <- forceDecrTrend(Bins, Bins[["varSummary"]]$var)
+    }
+    else{
+      Bins
+    }
+    values$Bins <- Bins
+  })
+  
+  # Optimize Bins
+  observeEvent(input$OptimizeAll, {
+    # values$all_iv_vars <- colnames(df[, !names(df) %in% input$DV])
+    # values$all_Bins <-  getBins(df, input$DV, values$all_iv_vars , minProp = minProp)
+    values$ModifiedAction <- TRUE
+
+    values$bins_vars <- values$all_Bins[["varSummary"]]$var
+    updateSelectInput(session, "IV", label = "Independent Variable",
+                      choices = values$bins_vars
+    )
+    show_modal_spinner() # process starts
+
+    values$all_bins_mod <- naCombine(values$all_Bins, values$all_Bins[["varSummary"]]$var)
+
+    # decreasing trend
+    decr_var <- filter(values$all_bins_mod[["varSummary"]], trend == "D")
+    if(nrow(decr_var) >= 1){
+    	values$all_bins_mod <- forceDecrTrend(values$all_bins_mod, decr_var$var)
+    	}
+    
+    incr_var <- filter(values$all_bins_mod[["varSummary"]], trend == "I")
+    if(nrow(incr_var) >= 1){
+    	values$all_bins_mod <- forceIncrTrend(values$all_bins_mod, incr_var$var)
+    	}
+    
+
+    remove_modal_spinner() # Computation done
+    # trend <- Bins[["varSummary"]]$trend[Bins[["varSummary"]]$var == input$IV]
+    
+    # if(trend == "I"){
+    #   Bins <- forceIncrTrend(Bins, Bins[["varSummary"]]$var)
+    # }
+    # else if (trend == "D"){
+    #   Bins <- forceDecrTrend(Bins, Bins[["varSummary"]]$var)
+    # }
+    # else{
+    #   Bins
+    # }
+    # values$Bins <- Bins
+  })
+
+  getPlotBin <- function(){
+  	if(values$ModifiedAction){
+    	  plot_bins <- filterBin(input$IV, values$all_bins_mod[["bin"]])
+    	}
+    	else{
+       plot_bins <- values$Bins[["bin"]]
+    	}
+    	return(plot_bins)
+  }
+  
+  # WOE Table
+  output$WOE_TABLE <- DT::renderDataTable({
+    if(is.null(values$Bins[["bin"]])){
+      Bins <- data.frame(var = factor(), bin = factor())
+    }
+    else{
+    	Bins <-  getPlotBin()
+    	Bins$woe <- calculateWOE(Bins$goods, Bins$bads)
+     Bins
+    }
+    
+    
+  }, options = list(pageLength = 50) )
+  
+  # WOE Line Graph
+  output$WOEGraph <- renderPlotly({
+    if(is.null(values$Bins[["bin"]])){
+      dataset <- data.frame(var = factor(), bin = factor(), bad_rate =double(), woe = numeric())
+    }
+    else{
+	dataset <- getPlotBin()
+    	dataset$woe <- calculateWOE(dataset$goods, dataset$bads)
+    }
+    df_plot <-dataset[dataset$bin != 'Total',]
+    
+    ay <- list(
+      tickfont= list(color = "#e74c3c"),
+      overlaying = "y",
+      side = "right",
+      title = "WOE",
+      gridcolor="#ecf0f1"
+    )
+    ay1 <- list(
+      tickfont= list(color = "#3498db"),
+      #overlaying = "y2",
+      side = "left",
+      title = "Good/Bad Rate",
+      gridcolor = "#bdc3c7"
+    )
+    # df_plot <- df_plot[order(df_plot$woe, decreasing = TRUE),]
+    xform <- list(categoryorder = "array",
+                  categoryarray = df_plot$bin)
+    plot_ly(df_plot, x = ~bin, y = ~woe, type = 'scatter', mode = 'line', name = 'WOE', yaxis = "y2") %>%
+      #add_trace(df_plot, x = ~bin, y = ~woe, type = 'scatter', mode = 'line', name = 'WOE', yaxis = "y1") %>%
+      add_trace(df_plot, x = ~bin, y = ~bad_rate / 100, type = 'scatter', mode = 'line', name = 'Bad Rate', yaxis = "y1") %>%
+      add_trace(df_plot, x = ~bin, y = ~(100-bad_rate) / 100, type = 'scatter', mode = 'line', name = 'Good Rate', yaxis = "y1") %>%
+      layout(title = "WOE", xaxis = xform,yaxis=ay1, yaxis2 = ay)
+    
+  })
+  
+  
+  # WOE Bar Graph
+  output$WOEBarGraph <- renderPlot({
+    if(is.null(values$Bins[["bin"]])){
+      dataset <- data.frame(var = factor(), bin = factor(), bad_rate =double())
+    }
+    else{
+      dataset <- getPlotBin()
+      dataset$woe <- calculateWOE(dataset$goods, dataset$bads)
+      df_plot <-dataset[dataset$bin != 'Total',]
+      df_plot$bin <- factor(df_plot$bin, levels = df_plot$bin)
+      limit <- max(df_plot$count) + (max(df_plot$count) / 5)
+      ggplot(data = df_plot, aes(x = bin, y = count)) +
+        geom_bar(stat='identity') +
+        geom_text(aes(label = bin), vjust = -2.8, size = 5) +
+        geom_text(aes(label = paste(paste(count, ',', sep = ''), round(propn, digits = 4))), vjust = -1.6, size = 5) +
+        geom_text(aes(label = paste('WOE:', round(woe, digits = 4), sep = ' ')), vjust = -0.3, size = 5) +
+        geom_bar(stat = 'identity', fill = '#1F77B4') +
+        expand_limits(y = limit) +
+        theme(axis.title = element_blank(), axis.text = element_text(size = 15)) +
+        theme(panel.background = element_blank())
+    }
+  })
+  
+  # Proporation Graph
+  output$PropGraph <- renderPlot({
+    if(is.null(values$Bins[["bin"]])){
+      dataset <- data.frame(var = factor(), bin = factor(), bad_rate =double())
+    }
+    else{
+	 dataset <- getPlotBin()
+      dataset$woe <- calculateWOE(dataset$goods, dataset$bads)
+      df_plot <-dataset[dataset$bin != 'Total',]
+      df_plot$bin <- factor(df_plot$bin, levels = df_plot$bin)
+      good_data <- data.frame(bin = df_plot$bin, condition = 'good', count = 100 - df_plot$bad_rate)
+      bad_data <- data.frame(bin = df_plot$bin, condition = 'bad', count = df_plot$bad_rate)
+      overall_data <- rbind(good_data, bad_data)
+      ggplot(data = overall_data, aes(fill = condition, x= bin, y = count)) +
+        geom_bar(position="stack", stat="identity") +
+        scale_fill_manual(values = c("#9ECC53", "#F25563")) +
+        theme(axis.title = element_blank(), axis.text = element_text(size = 15)) +
+        coord_flip() +
+        theme(panel.background = element_blank()) +
+        geom_text(aes(label = count), position = position_stack(vjust = 0.5), size = 7)
+    }
+  })
+  
+  # Measurements Table
+  output$Measurement_Table <- DT::renderDataTable({
+    initialBins <- values$initialBins[["bin"]]
+     # Bins <- values$Bins[["bin"]]                 # Fix incorrect entropy calculation dated 03-21-2022
+    Bins <- getPlotBin()                            # Fix incorrect entropy calculation dated 03-21-2022
+    if(!is.null(Bins)){
+      Bins$woe <- calculateWOE(Bins$goods, Bins$bads)
+      initialEntropy <- round(1 - (outputEntropy(initialBins) / inputEntropy(initialBins)), 5)
+      finalEntropy <- round(1 - (outputEntropy(Bins) / inputEntropy(Bins)), 5)
+      initialGini <- round(1 - (outputGini(initialBins) / inputGini(initialBins)), 5)
+      finalGini <- round(1 - (outputGini(Bins) / inputGini(Bins)), 5)
+      measurements <- data.frame("Initial Entropy" = initialEntropy, "Final Entropy" = finalEntropy, "Initial Gini" = initialGini, "Final Gini" = finalGini)
+    }else{
+      measurements <- data.frame("Initial Entropy" = 0.00, "Final Entropy" = 0.00, "Initial Gini" = 0.00, "Final Gini" = 0.00)
+    }
+    
+    measurements
+  }, options = list(pageLength = 50, dom = 't'))
+  
+  
+  
+  #  observe({
+  #    values$df_out <- df
+  #  })
+  
+  # save final modified Bins
+  observeEvent(input$Run, {
+    # values$all_iv_vars <- colnames(df[, !names(df) %in% input$DV])
+    values$all_iv_vars <- values$bins_vars
+    
+    #    if(!is.null(values$modified_bins)){
+    #      values$df_withBins <- cbind(values$df_withBins, values$df_withModifiedBins)
+    #     }
+   #  rules <- values$all_bins$bin[values$all_bins$bin$bin != 'Total', ]
+   if(values$ModifiedAction){
+ 	rules <- values$all_bins_mod$bin[values$all_bins_mod$bin$bin != 'Total',]
+   }
+   else{
+   	rules <- values$all_bins[values$all_bins_mod$bin$bin != 'Total',]
+   	}
+    rules$woe <- calculateWOE(rules$goods, rules$bads)
+
+    
+    for (i in 1:length(values$all_bins_mod[["varSummary"]]$var)){
+      for(j in 1:nrow(rules)){
+        if(rules$var[j] == values$all_bins_mod[["varSummary"]]$var[i]){
+          rules[j, 'binValue'] <- gsub(" %in% c", "", gsub(values$all_bins_mod[["varSummary"]]$var[i], "", rules$bin[j]))
+        }
+      }
+    }
+    saveRDS(rules, "bins.RDS")
+    values$createBins <- createNewBins(values$all_bins_mod, df, values$all_bins_mod[["varSummary"]]$var)
+    # print(values$createBins)
+    for(i in 1:length(values$all_bins_mod[["varSummary"]]$var)){
+
+	 x <- paste0('b_', values$all_bins_mod[["varSummary"]]$var[i])
+	 rule_temp <- rules[rules$var == values$all_bins_mod[["varSummary"]]$var[i], c("binValue","woe")]
+	 names(rule_temp)[names(rule_temp) == 'binValue'] <- x
+	 values$createBins <- plyr::join(values$createBins, 
+	      				rule_temp, 
+	      				type = "left",
+	      				by = paste0(x)
+	      				)
+      names(values$createBins)[names(values$createBins) == 'woe'] <- paste0('WOE_', values$all_bins_mod[["varSummary"]]$var[i])
+    }
+
+
+#    if(!is.null(values$modified_bins)){
+#      rules <- rbind(rules, modified_rules)
+#    }
+# deleted   
+
+    # deleted ends
+#    values$df_withBins[, paste0(input$DV)] <- df[, input$DV]
+#    values$df_withBins[values$bins_vars] <- NULL
+    saveRDS(values$createBins, "df_iv_all.RDS")
+    
+    if(input$Run > 0){stopApp()}
+  })
+  
+  # save final modified Bins
+  observeEvent(input$Update, {
+    # IV_Bin <- paste("Bin_", input$IV, ".RDS", sep ="")
+    # col <- createBins(values$Bins, df, input$IV)
+    # rules <- values$Bins$bin[values$Bins$bin$bin != 'Total', ]
+    # for(i in 1:nrow(rules)){
+    #   rules[i, 'binValue'] <- (gsub(" %in% c", "", gsub(input$IV, "", rules$bin[i])))
+    # }
+    # rules$woe <- calculateWOE(rules$goods, rules$bads)
+    # values$df_out[, paste0('b_', input$IV)] <- col[, ncol(col)]
+    # values$df_out <- merge(values$df_out, rules[, c("binValue","woe")], by.x = paste0('b_', input$IV), by.y = "binValue")
+    # names(values$df_out)[names(values$df_out) == 'woe'] <- paste0('WOE_', input$IV)
+    
+    values$modified_bins <- rbind(values$modified_bins,values$Bins[["bin"]])
+  })
+  
+}
+
+#run server in parallel
+plan(multisession)
+app <- shinyApp(ui, server)
+
+runApp(app)
+
+# Knime Output Setup
+df_with_woe <- readRDS('df_iv_all.RDS')
+bins <- readRDS('bins.RDS')
+DV <- readRDS("DV.RDS")
+df_only_woe <- df_with_woe[, grep("WOE_", colnames(df_with_woe))]
+df_only_woe[, DV] <- df_with_woe[DV]
+}
+
+
+
+
+
+
+
+################################# WOE Editor ############################################
+# Ends
+#########################################################################################

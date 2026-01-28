@@ -1,0 +1,44 @@
+# Scorecard Node - Correct Inputs Guide
+
+## Input Port 1: Coefficients (from Logistic Regression Node)
+- Should be Output 2 from the Logistic Regression node
+- Contains model coefficients
+- Format: Row ID = variable name, Column = coefficient value
+- Example rows:
+  - (Intercept): -2.5
+  - WOE_Age: 0.8
+  - WOE_Income: 1.2
+
+## Input Port 2: Bins (from WOE Editor Node) *** IMPORTANT ***
+- Should be Output 4 from the WOE Editor node (NOT Output 2 or 3!)
+- Contains BINNING RULES, not data with WOE values
+- Typical size: 5-20 bins per variable
+- Required columns: var, bin, binValue, woe
+
+### What NOT to use:
+❌ Output 2 (df_with_woe) - This is your original data with WOE columns
+❌ Output 3 (df_only_woe) - This is your data with only WOE columns
+✅ Output 4 (bins) - This is the BINNING RULES table
+
+### How to check if you have the right input:
+1. Look at the row count
+   - CORRECT: 50-200 rows (a few bins per variable)
+   - WRONG: Thousands or millions of rows (this is your data, not bins!)
+
+2. Look at the 'var' column
+   - CORRECT: Each variable appears 5-20 times
+   - WRONG: Each variable appears thousands of times
+
+## Note on Processing Time:
+The Scorecard node will process ALL interactions, regardless of size.
+- Small interactions (10 × 10 = 100 combinations): Instant
+- Medium interactions (50 × 50 = 2,500 combinations): Seconds
+- Large interactions (100 × 100 = 10,000 combinations): May take longer
+
+The node will show progress in the console:
+"INFO: Interaction var1_x_var2 will create 10,000 combinations"
+"This may take some time to process..."
+
+## Best Practice:
+Use the WOE Editor's MAX_BINS setting to control bin counts BEFORE creating the scorecard.
+This prevents excessive combinations at the source.

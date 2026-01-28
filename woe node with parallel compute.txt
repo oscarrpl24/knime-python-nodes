@@ -1,0 +1,1746 @@
+# =============================================================================
+# WOE Editor for KNIME Python Script Node - PARALLEL VERSION
+# =============================================================================
+# Python implementation matching R's WOE Editor functionality
+# Compatible with KNIME 5.9, Python 3.9
+#
+# This version uses parallel processing to utilize multiple CPU cores
+# for faster processing of large datasets with many variables.
+#
+# This script has two modes:
+# 1. Interactive (Shiny UI) - When no flow variables are provided
+# 2. Headless - When DependentVariable flow variable is provided
+#
+# Outputs:
+# 1. Original input DataFrame (unchanged)
+# 2. df_with_woe - Original data + binned columns (b_*) + WOE columns (WOE_*)
+# 3. df_only_woe - Only WOE columns + dependent variable
+# 4. bins - Binning rules with WOE values
+#
+# Release Date: 2026-01-15
+# Version: 2.0 (Parallel)
+# =============================================================================
+
+import knime.scripting.io as knio
+import pandas as pd
+import numpy as np
+import re
+import warnings
+import os
+import multiprocessing
+from typing import Dict, List, Tuple, Optional, Any, Union
+from dataclasses import dataclass
+
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# Install/Import Dependencies
+# =============================================================================
+
+try:
+    from sklearn.tree import DecisionTreeClassifier
+except ImportError:
+    import subprocess
+    subprocess.check_call(['pip', 'install', 'scikit-learn'])
+    from sklearn.tree import DecisionTreeClassifier
+
+try:
+    from joblib import Parallel, delayed
+except ImportError:
+    import subprocess
+    subprocess.check_call(['pip', 'install', 'joblib'])
+    from joblib import Parallel, delayed
+
+try:
+    from shiny import App, Inputs, Outputs, Session, reactive, render, ui
+    from shinywidgets import render_plotly, output_widget
+    import plotly.graph_objects as go
+except ImportError:
+    import subprocess
+    subprocess.check_call(['pip', 'install', 'shiny', 'shinywidgets', 'plotly'])
+    from shiny import App, Inputs, Outputs, Session, reactive, render, ui
+    from shinywidgets import render_plotly, output_widget
+    import plotly.graph_objects as go
+
+
+# =============================================================================
+# Resource Detection
+# =============================================================================
+
+def get_optimal_n_jobs(reserve_cores: int = 1, max_usage_percent: float = 0.75) -> int:
+    """
+    Determine optimal number of parallel jobs based on available system resources.
+    
+    Parameters:
+    -----------
+    reserve_cores : int
+        Number of cores to reserve for system/other processes (default: 1)
+    max_usage_percent : float
+        Maximum percentage of cores to use (default: 0.75 = 75%)
+    
+    Returns:
+    --------
+    int : Optimal number of parallel jobs
+    """
+    try:
+        # Get logical processor count (includes hyperthreading)
+        logical_cores = os.cpu_count() or 1
+        
+        # Try to get physical core count (more accurate for CPU-bound tasks)
+        try:
+            # On Windows, this gives physical cores
+            physical_cores = multiprocessing.cpu_count()
+        except:
+            physical_cores = logical_cores
+        
+        # For CPU-bound tasks like decision trees, physical cores are more relevant
+        # but we can benefit from some hyperthreading
+        effective_cores = min(logical_cores, int(physical_cores * 1.5))
+        
+        # Apply maximum usage percentage
+        max_cores = max(1, int(effective_cores * max_usage_percent))
+        
+        # Reserve some cores for system
+        available_cores = max(1, max_cores - reserve_cores)
+        
+        print(f"[Parallel Config] Detected: {logical_cores} logical processors, "
+              f"{physical_cores} physical cores")
+        print(f"[Parallel Config] Using: {available_cores} parallel workers "
+              f"(reserved {reserve_cores} for system)")
+        
+        return available_cores
+        
+    except Exception as e:
+        print(f"[Parallel Config] Error detecting cores: {e}, defaulting to 4")
+        return 4
+
+
+# Global configuration - detect once at startup
+N_JOBS = get_optimal_n_jobs(reserve_cores=1, max_usage_percent=0.75)
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+@dataclass
+class BinResult:
+    """Container for binning results"""
+    var_summary: pd.DataFrame  # Summary stats for each variable
+    bin: pd.DataFrame  # Detailed bin information
+
+
+# =============================================================================
+# Core Binning Functions
+# =============================================================================
+
+def calculate_woe(freq_good: np.ndarray, freq_bad: np.ndarray) -> np.ndarray:
+    """
+    Calculate Weight of Evidence (WOE) for each bin.
+    WOE = ln((% of Bads in bin) / (% of Goods in bin))
+    """
+    freq_good = np.array(freq_good, dtype=float)
+    freq_bad = np.array(freq_bad, dtype=float)
+    
+    total_good = freq_good.sum()
+    total_bad = freq_bad.sum()
+    
+    if total_good == 0 or total_bad == 0:
+        return np.zeros(len(freq_good))
+    
+    dist_good = freq_good / total_good
+    dist_bad = freq_bad / total_bad
+    
+    dist_good = np.where(dist_good == 0, 0.0001, dist_good)
+    dist_bad = np.where(dist_bad == 0, 0.0001, dist_bad)
+    
+    woe = np.round(np.log(dist_bad / dist_good), 5)
+    return woe
+
+
+def calculate_iv(freq_good: np.ndarray, freq_bad: np.ndarray) -> float:
+    """Calculate Information Value (IV) for a variable."""
+    freq_good = np.array(freq_good, dtype=float)
+    freq_bad = np.array(freq_bad, dtype=float)
+    
+    total_good = freq_good.sum()
+    total_bad = freq_bad.sum()
+    
+    if total_good == 0 or total_bad == 0:
+        return 0.0
+    
+    dist_good = freq_good / total_good
+    dist_bad = freq_bad / total_bad
+    
+    dist_good_safe = np.where(dist_good == 0, 0.0001, dist_good)
+    dist_bad_safe = np.where(dist_bad == 0, 0.0001, dist_bad)
+    
+    woe = np.log(dist_bad_safe / dist_good_safe)
+    iv = np.sum((dist_bad - dist_good) * woe)
+    
+    if not np.isfinite(iv):
+        iv = 0.0
+        
+    return round(iv, 4)
+
+
+def calculate_entropy(goods: int, bads: int) -> float:
+    """Calculate entropy for a bin."""
+    total = goods + bads
+    if total == 0 or goods == 0 or bads == 0:
+        return 0.0
+    
+    p_good = goods / total
+    p_bad = bads / total
+    
+    entropy = -1 * ((p_bad * np.log2(p_bad)) + (p_good * np.log2(p_good)))
+    return round(entropy, 4)
+
+
+def get_var_type(series: pd.Series) -> str:
+    """Determine if variable is numeric or factor (categorical)"""
+    if pd.api.types.is_numeric_dtype(series):
+        if series.nunique() <= 10:
+            return 'factor'
+        return 'numeric'
+    return 'factor'
+
+
+def _get_decision_tree_splits(
+    x: pd.Series, 
+    y: pd.Series, 
+    min_prop: float = 0.01,
+    max_bins: int = 10
+) -> List[float]:
+    """Use decision tree to find optimal split points for numeric variables."""
+    mask = x.notna() & y.notna()
+    x_clean = x[mask].values.reshape(-1, 1)
+    y_clean = y[mask].values
+    
+    if len(x_clean) == 0:
+        return []
+    
+    min_samples_leaf = max(int(len(x_clean) * min_prop), 1)
+    
+    tree = DecisionTreeClassifier(
+        max_leaf_nodes=max_bins,
+        min_samples_leaf=min_samples_leaf,
+        random_state=42
+    )
+    
+    try:
+        tree.fit(x_clean, y_clean)
+    except Exception:
+        return []
+    
+    thresholds = tree.tree_.threshold
+    thresholds = thresholds[thresholds != -2]
+    thresholds = sorted(set(thresholds))
+    
+    return thresholds
+
+
+def _create_numeric_bins(
+    df: pd.DataFrame,
+    var: str,
+    y_var: str,
+    splits: List[float]
+) -> pd.DataFrame:
+    """Create bin DataFrame for numeric variable based on splits."""
+    x = df[var]
+    y = df[y_var]
+    
+    bins_data = []
+    splits = sorted(splits)
+    edges = [-np.inf] + splits + [np.inf]
+    
+    for i in range(len(edges) - 1):
+        lower = edges[i]
+        upper = edges[i + 1]
+        
+        if lower == -np.inf:
+            mask = (x <= upper) & x.notna()
+            bin_rule = f"{var} <= '{upper}'"
+        elif upper == np.inf:
+            mask = (x > lower) & x.notna()
+            bin_rule = f"{var} > '{lower}'"
+        else:
+            mask = (x > lower) & (x <= upper) & x.notna()
+            bin_rule = f"{var} > '{lower}' & {var} <= '{upper}'"
+        
+        count = mask.sum()
+        if count > 0:
+            bads = y[mask].sum()
+            goods = count - bads
+            bins_data.append({
+                'var': var,
+                'bin': bin_rule,
+                'count': count,
+                'bads': int(bads),
+                'goods': int(goods)
+            })
+    
+    na_mask = x.isna()
+    if na_mask.sum() > 0:
+        na_count = na_mask.sum()
+        na_bads = y[na_mask].sum()
+        na_goods = na_count - na_bads
+        bins_data.append({
+            'var': var,
+            'bin': f"is.na({var})",
+            'count': int(na_count),
+            'bads': int(na_bads),
+            'goods': int(na_goods)
+        })
+    
+    return pd.DataFrame(bins_data)
+
+
+def _create_factor_bins(
+    df: pd.DataFrame,
+    var: str,
+    y_var: str
+) -> pd.DataFrame:
+    """Create bin DataFrame for factor/categorical variable."""
+    x = df[var]
+    y = df[y_var]
+    
+    bins_data = []
+    unique_vals = x.dropna().unique()
+    
+    for val in unique_vals:
+        mask = x == val
+        count = mask.sum()
+        if count > 0:
+            bads = y[mask].sum()
+            goods = count - bads
+            bins_data.append({
+                'var': var,
+                'bin': f'{var} %in% c("{val}")',
+                'count': int(count),
+                'bads': int(bads),
+                'goods': int(goods)
+            })
+    
+    na_mask = x.isna()
+    if na_mask.sum() > 0:
+        na_count = na_mask.sum()
+        na_bads = y[na_mask].sum()
+        na_goods = na_count - na_bads
+        bins_data.append({
+            'var': var,
+            'bin': f"is.na({var})",
+            'count': int(na_count),
+            'bads': int(na_bads),
+            'goods': int(na_goods)
+        })
+    
+    return pd.DataFrame(bins_data)
+
+
+def update_bin_stats(bin_df: pd.DataFrame) -> pd.DataFrame:
+    """Update bin statistics (propn, bad_rate, iv, ent, trend, etc.)"""
+    if bin_df.empty:
+        return bin_df
+    
+    df = bin_df.copy()
+    
+    total_count = df['count'].sum()
+    total_goods = df['goods'].sum()
+    total_bads = df['bads'].sum()
+    
+    df['propn'] = round(df['count'] / total_count * 100, 2)
+    df['bad_rate'] = round(df['bads'] / df['count'] * 100, 2)
+    
+    df['goodCap'] = df['goods'] / total_goods if total_goods > 0 else 0
+    df['badCap'] = df['bads'] / total_bads if total_bads > 0 else 0
+    
+    df['iv'] = round((df['goodCap'] - df['badCap']) * np.log(
+        np.where(df['goodCap'] == 0, 0.0001, df['goodCap']) / 
+        np.where(df['badCap'] == 0, 0.0001, df['badCap'])
+    ), 4)
+    
+    df['iv'] = df['iv'].replace([np.inf, -np.inf], 0)
+    
+    df['ent'] = df.apply(
+        lambda row: calculate_entropy(row['goods'], row['bads']), 
+        axis=1
+    )
+    
+    df['purNode'] = np.where((df['bads'] == 0) | (df['goods'] == 0), 'Y', 'N')
+    
+    df['trend'] = None
+    bad_rates = df['bad_rate'].values
+    for i in range(1, len(bad_rates)):
+        if 'is.na' not in str(df.iloc[i]['bin']):
+            if bad_rates[i] >= bad_rates[i-1]:
+                df.iloc[i, df.columns.get_loc('trend')] = 'I'
+            else:
+                df.iloc[i, df.columns.get_loc('trend')] = 'D'
+    
+    return df
+
+
+def add_total_row(bin_df: pd.DataFrame, var: str) -> pd.DataFrame:
+    """Add a total row to the bin DataFrame."""
+    df = bin_df.copy()
+    
+    total_count = df['count'].sum()
+    total_goods = df['goods'].sum()
+    total_bads = df['bads'].sum()
+    total_iv = df['iv'].replace([np.inf, -np.inf], 0).sum()
+    
+    if total_count > 0:
+        total_ent = round((df['ent'] * df['count'] / total_count).sum(), 4)
+    else:
+        total_ent = 0
+    
+    trends = df[df['trend'].notna()]['trend'].unique()
+    mon_trend = 'Y' if len(trends) <= 1 else 'N'
+    
+    incr_count = len(df[df['trend'] == 'I'])
+    decr_count = len(df[df['trend'] == 'D'])
+    total_trend_count = incr_count + decr_count
+    flip_ratio = min(incr_count, decr_count) / total_trend_count if total_trend_count > 0 else 0
+    
+    overall_trend = 'I' if incr_count >= decr_count else 'D'
+    has_pure_node = 'Y' if (df['purNode'] == 'Y').any() else 'N'
+    num_bins = len(df)
+    
+    total_row = pd.DataFrame([{
+        'var': var,
+        'bin': 'Total',
+        'count': total_count,
+        'bads': total_bads,
+        'goods': total_goods,
+        'propn': 100.0,
+        'bad_rate': round(total_bads / total_count * 100, 2) if total_count > 0 else 0,
+        'goodCap': 1.0,
+        'badCap': 1.0,
+        'iv': round(total_iv, 4),
+        'ent': total_ent,
+        'purNode': has_pure_node,
+        'trend': overall_trend,
+        'monTrend': mon_trend,
+        'flipRatio': round(flip_ratio, 4),
+        'numBins': num_bins
+    }])
+    
+    return pd.concat([df, total_row], ignore_index=True)
+
+
+# =============================================================================
+# Parallel Processing Functions
+# =============================================================================
+
+def _process_single_var(
+    df: pd.DataFrame, 
+    var: str, 
+    y_var: str, 
+    min_prop: float, 
+    max_bins: int
+) -> Tuple[Optional[Dict], Optional[pd.DataFrame]]:
+    """
+    Process a single variable for binning - designed for parallel execution.
+    
+    Returns:
+    --------
+    Tuple of (var_summary dict, bin_df DataFrame) or (None, None) if failed
+    """
+    try:
+        if var not in df.columns:
+            return None, None
+        
+        var_type = get_var_type(df[var])
+        
+        if var_type == 'numeric':
+            splits = _get_decision_tree_splits(df[var], df[y_var], min_prop, max_bins)
+            bin_df = _create_numeric_bins(df, var, y_var, splits)
+        else:
+            bin_df = _create_factor_bins(df, var, y_var)
+        
+        if bin_df.empty:
+            return None, None
+        
+        bin_df = update_bin_stats(bin_df)
+        bin_df = add_total_row(bin_df, var)
+        
+        total_row = bin_df[bin_df['bin'] == 'Total'].iloc[0]
+        var_summary = {
+            'var': var,
+            'varType': var_type,
+            'iv': total_row['iv'],
+            'ent': total_row['ent'],
+            'trend': total_row['trend'],
+            'monTrend': total_row.get('monTrend', 'N'),
+            'flipRatio': total_row.get('flipRatio', 0),
+            'numBins': total_row.get('numBins', len(bin_df) - 1),
+            'purNode': total_row['purNode']
+        }
+        
+        return var_summary, bin_df
+        
+    except Exception as e:
+        print(f"[Parallel] Error processing variable '{var}': {e}")
+        return None, None
+
+
+def get_bins(
+    df: pd.DataFrame,
+    y_var: str,
+    x_vars: List[str],
+    min_prop: float = 0.01,
+    max_bins: int = 10,
+    n_jobs: Optional[int] = None
+) -> BinResult:
+    """
+    Get optimal bins for multiple variables using parallel processing.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input data
+    y_var : str
+        Name of the dependent variable (binary target)
+    x_vars : List[str]
+        List of independent variable names to bin
+    min_prop : float
+        Minimum proportion of samples in each bin (default: 0.01)
+    max_bins : int
+        Maximum number of bins per variable (default: 10)
+    n_jobs : int, optional
+        Number of parallel jobs. If None, uses global N_JOBS setting.
+    
+    Returns:
+    --------
+    BinResult : Container with var_summary and bin DataFrames
+    """
+    if n_jobs is None:
+        n_jobs = N_JOBS
+    
+    # Use parallel processing if we have multiple variables and cores
+    if len(x_vars) > 1 and n_jobs > 1:
+        print(f"[Parallel] Processing {len(x_vars)} variables using {n_jobs} workers...")
+        
+        try:
+            results = Parallel(n_jobs=n_jobs, prefer="processes", verbose=0)(
+                delayed(_process_single_var)(df, var, y_var, min_prop, max_bins)
+                for var in x_vars
+            )
+        except Exception as e:
+            print(f"[Parallel] Parallel processing failed: {e}, falling back to sequential")
+            results = [_process_single_var(df, var, y_var, min_prop, max_bins) for var in x_vars]
+    else:
+        # Sequential processing for single variable or single core
+        results = [_process_single_var(df, var, y_var, min_prop, max_bins) for var in x_vars]
+    
+    # Collect results
+    var_summaries = []
+    all_bins = []
+    
+    for var_summary, bin_df in results:
+        if var_summary is not None:
+            var_summaries.append(var_summary)
+            all_bins.append(bin_df)
+    
+    if all_bins:
+        combined_bins = pd.concat(all_bins, ignore_index=True)
+    else:
+        combined_bins = pd.DataFrame()
+    
+    var_summary_df = pd.DataFrame(var_summaries)
+    
+    print(f"[Parallel] Completed binning for {len(var_summaries)} variables")
+    
+    return BinResult(var_summary=var_summary_df, bin=combined_bins)
+
+
+def manual_split(
+    bin_result: BinResult,
+    var: str,
+    y_var: str,
+    splits: List[float],
+    df: pd.DataFrame
+) -> BinResult:
+    """Manually split a numeric variable at specified points."""
+    bin_df = _create_numeric_bins(df, var, y_var, splits)
+    
+    if bin_df.empty:
+        return bin_result
+    
+    bin_df = update_bin_stats(bin_df)
+    bin_df = add_total_row(bin_df, var)
+    
+    other_bins = bin_result.bin[bin_result.bin['var'] != var].copy()
+    new_bins = pd.concat([other_bins, bin_df], ignore_index=True)
+    
+    total_row = bin_df[bin_df['bin'] == 'Total'].iloc[0]
+    var_summary = bin_result.var_summary.copy()
+    
+    mask = var_summary['var'] == var
+    if mask.any():
+        var_summary.loc[mask, 'iv'] = total_row['iv']
+        var_summary.loc[mask, 'ent'] = total_row['ent']
+        var_summary.loc[mask, 'trend'] = total_row['trend']
+        var_summary.loc[mask, 'monTrend'] = total_row.get('monTrend', 'N')
+        var_summary.loc[mask, 'flipRatio'] = total_row.get('flipRatio', 0)
+        var_summary.loc[mask, 'numBins'] = total_row.get('numBins', len(bin_df) - 1)
+        var_summary.loc[mask, 'purNode'] = total_row['purNode']
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+# =============================================================================
+# Bin Operations Functions
+# =============================================================================
+
+def _parse_numeric_from_rule(rule: str) -> List[float]:
+    """Extract numeric values from a bin rule string."""
+    pattern = r"'(-?\d+\.?\d*)'"
+    matches = re.findall(pattern, rule)
+    return [float(m) for m in matches]
+
+
+def _parse_factor_values_from_rule(rule: str) -> List[str]:
+    """Extract factor values from a bin rule string."""
+    pattern = r'"([^"]*)"'
+    matches = re.findall(pattern, rule)
+    return matches
+
+
+def _process_na_combine_single_var(
+    new_bins: pd.DataFrame,
+    var: str
+) -> Tuple[str, pd.DataFrame, Optional[Dict]]:
+    """Process NA combine for a single variable - for parallel execution."""
+    var_bins = new_bins[new_bins['var'] == var].copy()
+    
+    if var_bins.empty:
+        return var, pd.DataFrame(), None
+    
+    na_mask = var_bins['bin'].str.contains('is.na', regex=False, na=False)
+    
+    if not na_mask.any():
+        return var, var_bins, None
+    
+    na_bin = var_bins[na_mask].iloc[0]
+    non_na_bins = var_bins[~na_mask & (var_bins['bin'] != 'Total')]
+    
+    if non_na_bins.empty:
+        return var, var_bins, None
+    
+    na_bad_rate = na_bin['bads'] / na_bin['count'] if na_bin['count'] > 0 else 0
+    non_na_bins = non_na_bins.copy()
+    non_na_bins['bad_rate_calc'] = non_na_bins['bads'] / non_na_bins['count']
+    non_na_bins['rate_diff'] = abs(non_na_bins['bad_rate_calc'] - na_bad_rate)
+    
+    closest_idx = non_na_bins['rate_diff'].idxmin()
+    closest_bin = non_na_bins.loc[closest_idx]
+    
+    combined_rule = f"{closest_bin['bin']} | is.na({var})"
+    combined_count = closest_bin['count'] + na_bin['count']
+    combined_goods = closest_bin['goods'] + na_bin['goods']
+    combined_bads = closest_bin['bads'] + na_bin['bads']
+    
+    # Create modified bins
+    modified_bins = var_bins.copy()
+    modified_bins.loc[closest_idx, 'bin'] = combined_rule
+    modified_bins.loc[closest_idx, 'count'] = combined_count
+    modified_bins.loc[closest_idx, 'goods'] = combined_goods
+    modified_bins.loc[closest_idx, 'bads'] = combined_bads
+    
+    na_idx = var_bins[na_mask].index[0]
+    modified_bins = modified_bins.drop(na_idx)
+    
+    # Recalculate stats
+    var_new_bins = modified_bins[modified_bins['bin'] != 'Total'].copy()
+    var_new_bins = update_bin_stats(var_new_bins)
+    var_new_bins = add_total_row(var_new_bins, var)
+    
+    total_row = var_new_bins[var_new_bins['bin'] == 'Total'].iloc[0]
+    var_summary_update = {
+        'var': var,
+        'iv': total_row['iv'],
+        'ent': total_row['ent'],
+        'trend': total_row['trend'],
+        'monTrend': total_row.get('monTrend', 'N'),
+        'flipRatio': total_row.get('flipRatio', 0),
+        'numBins': total_row.get('numBins', len(var_new_bins) - 1),
+        'purNode': total_row['purNode']
+    }
+    
+    return var, var_new_bins, var_summary_update
+
+
+def na_combine(
+    bin_result: BinResult,
+    vars_to_process: Union[str, List[str]],
+    n_jobs: Optional[int] = None
+) -> BinResult:
+    """
+    Combine NA bin with the adjacent bin that has the closest bad rate.
+    Uses parallel processing for multiple variables.
+    """
+    if isinstance(vars_to_process, str):
+        vars_to_process = [vars_to_process]
+    
+    if n_jobs is None:
+        n_jobs = N_JOBS
+    
+    new_bins = bin_result.bin.copy()
+    var_summary = bin_result.var_summary.copy()
+    
+    # Process variables in parallel
+    if len(vars_to_process) > 1 and n_jobs > 1:
+        try:
+            results = Parallel(n_jobs=n_jobs, prefer="processes", verbose=0)(
+                delayed(_process_na_combine_single_var)(new_bins, var)
+                for var in vars_to_process
+            )
+        except:
+            results = [_process_na_combine_single_var(new_bins, var) for var in vars_to_process]
+    else:
+        results = [_process_na_combine_single_var(new_bins, var) for var in vars_to_process]
+    
+    # Combine results
+    processed_vars = set()
+    all_processed_bins = []
+    
+    for var, var_bins, var_summary_update in results:
+        if not var_bins.empty:
+            processed_vars.add(var)
+            all_processed_bins.append(var_bins)
+            
+            if var_summary_update is not None:
+                mask = var_summary['var'] == var
+                if mask.any():
+                    for key, value in var_summary_update.items():
+                        if key != 'var' and key in var_summary.columns:
+                            var_summary.loc[mask, key] = value
+    
+    # Combine unprocessed vars with processed vars
+    unprocessed_bins = new_bins[~new_bins['var'].isin(processed_vars)]
+    if all_processed_bins:
+        final_bins = pd.concat([unprocessed_bins] + all_processed_bins, ignore_index=True)
+    else:
+        final_bins = unprocessed_bins
+    
+    return BinResult(var_summary=var_summary, bin=final_bins)
+
+
+def break_bin(
+    bin_result: BinResult,
+    var: str,
+    y_var: str,
+    df: pd.DataFrame
+) -> BinResult:
+    """Break all bins for a factor variable - each unique value becomes its own bin."""
+    new_var_bins = _create_factor_bins(df, var, y_var)
+    new_var_bins = update_bin_stats(new_var_bins)
+    new_var_bins = add_total_row(new_var_bins, var)
+    
+    other_bins = bin_result.bin[bin_result.bin['var'] != var].copy()
+    new_bins = pd.concat([other_bins, new_var_bins], ignore_index=True)
+    
+    total_row = new_var_bins[new_var_bins['bin'] == 'Total'].iloc[0]
+    var_summary = bin_result.var_summary.copy()
+    mask = var_summary['var'] == var
+    if mask.any():
+        var_summary.loc[mask, 'iv'] = total_row['iv']
+        var_summary.loc[mask, 'ent'] = total_row['ent']
+        var_summary.loc[mask, 'trend'] = total_row['trend']
+        var_summary.loc[mask, 'monTrend'] = total_row.get('monTrend', 'N')
+        var_summary.loc[mask, 'flipRatio'] = total_row.get('flipRatio', 0)
+        var_summary.loc[mask, 'numBins'] = total_row.get('numBins', len(new_var_bins) - 1)
+        var_summary.loc[mask, 'purNode'] = total_row['purNode']
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+def _process_force_trend_single_var(
+    var_bins: pd.DataFrame,
+    var: str,
+    increasing: bool
+) -> Tuple[str, pd.DataFrame, Optional[Dict]]:
+    """Process force trend for a single variable - for parallel execution."""
+    if var_bins.empty or len(var_bins) < 2:
+        return var, var_bins, None
+    
+    na_mask = var_bins['bin'].str.contains('is.na', regex=False, na=False)
+    na_bin = var_bins[na_mask].copy() if na_mask.any() else pd.DataFrame()
+    working_bins = var_bins[~na_mask].copy()
+    
+    if working_bins.empty:
+        return var, var_bins, None
+    
+    working_bins = working_bins.reset_index(drop=True)
+    
+    changed = True
+    while changed and len(working_bins) > 1:
+        changed = False
+        working_bins['bad_rate_calc'] = working_bins['bads'] / working_bins['count']
+        
+        for i in range(1, len(working_bins)):
+            should_merge = (
+                (increasing and working_bins.iloc[i]['bad_rate_calc'] < working_bins.iloc[i-1]['bad_rate_calc']) or
+                (not increasing and working_bins.iloc[i]['bad_rate_calc'] > working_bins.iloc[i-1]['bad_rate_calc'])
+            )
+            
+            if should_merge:
+                working_bins.iloc[i-1, working_bins.columns.get_loc('count')] += working_bins.iloc[i]['count']
+                working_bins.iloc[i-1, working_bins.columns.get_loc('goods')] += working_bins.iloc[i]['goods']
+                working_bins.iloc[i-1, working_bins.columns.get_loc('bads')] += working_bins.iloc[i]['bads']
+                
+                old_rule = working_bins.iloc[i-1]['bin']
+                new_rule = working_bins.iloc[i]['bin']
+                
+                if '<=' in new_rule:
+                    new_upper = _parse_numeric_from_rule(new_rule)
+                    if new_upper:
+                        max_upper = max(new_upper)
+                        if '<=' in old_rule and '>' in old_rule:
+                            lower_vals = _parse_numeric_from_rule(old_rule.split('&')[0]) if '&' in old_rule else []
+                            if lower_vals:
+                                working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} > '{min(lower_vals)}' & {var} <= '{max_upper}'"
+                            else:
+                                working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} <= '{max_upper}'"
+                        elif '<=' in old_rule:
+                            working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} <= '{max_upper}'"
+                elif '>' in new_rule and '<=' not in new_rule:
+                    if '>' in old_rule:
+                        old_lower = _parse_numeric_from_rule(old_rule.split('&')[0]) if '&' in old_rule else _parse_numeric_from_rule(old_rule)
+                        if old_lower:
+                            working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} > '{min(old_lower)}'"
+                
+                working_bins = working_bins.drop(working_bins.index[i]).reset_index(drop=True)
+                changed = True
+                break
+    
+    if not na_bin.empty:
+        working_bins = pd.concat([working_bins, na_bin], ignore_index=True)
+    
+    if 'bad_rate_calc' in working_bins.columns:
+        working_bins = working_bins.drop('bad_rate_calc', axis=1)
+    
+    working_bins = update_bin_stats(working_bins)
+    working_bins = add_total_row(working_bins, var)
+    
+    total_row = working_bins[working_bins['bin'] == 'Total'].iloc[0]
+    var_summary_update = {
+        'var': var,
+        'iv': total_row['iv'],
+        'ent': total_row['ent'],
+        'trend': total_row['trend'],
+        'monTrend': total_row.get('monTrend', 'Y'),
+        'flipRatio': total_row.get('flipRatio', 0),
+        'numBins': total_row.get('numBins', len(working_bins) - 1),
+        'purNode': total_row['purNode']
+    }
+    
+    return var, working_bins, var_summary_update
+
+
+def force_incr_trend(
+    bin_result: BinResult,
+    vars_to_process: Union[str, List[str]],
+    n_jobs: Optional[int] = None
+) -> BinResult:
+    """
+    Force an increasing monotonic trend in bad rates by combining adjacent bins.
+    Uses parallel processing for multiple variables.
+    """
+    if isinstance(vars_to_process, str):
+        vars_to_process = [vars_to_process]
+    
+    if n_jobs is None:
+        n_jobs = N_JOBS
+    
+    new_bins = bin_result.bin.copy()
+    var_summary = bin_result.var_summary.copy()
+    
+    # Prepare data for each variable
+    var_data = []
+    for var in vars_to_process:
+        var_bins = new_bins[(new_bins['var'] == var) & (new_bins['bin'] != 'Total')].copy()
+        var_data.append((var_bins, var, True))  # True = increasing
+    
+    # Process in parallel
+    if len(vars_to_process) > 1 and n_jobs > 1:
+        try:
+            results = Parallel(n_jobs=n_jobs, prefer="processes", verbose=0)(
+                delayed(_process_force_trend_single_var)(vb, v, inc)
+                for vb, v, inc in var_data
+            )
+        except:
+            results = [_process_force_trend_single_var(vb, v, inc) for vb, v, inc in var_data]
+    else:
+        results = [_process_force_trend_single_var(vb, v, inc) for vb, v, inc in var_data]
+    
+    # Combine results
+    for var, working_bins, var_summary_update in results:
+        if not working_bins.empty:
+            new_bins = new_bins[new_bins['var'] != var]
+            new_bins = pd.concat([new_bins, working_bins], ignore_index=True)
+            
+            if var_summary_update is not None:
+                mask = var_summary['var'] == var
+                if mask.any():
+                    for key, value in var_summary_update.items():
+                        if key != 'var' and key in var_summary.columns:
+                            var_summary.loc[mask, key] = value
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+def force_decr_trend(
+    bin_result: BinResult,
+    vars_to_process: Union[str, List[str]],
+    n_jobs: Optional[int] = None
+) -> BinResult:
+    """
+    Force a decreasing monotonic trend in bad rates by combining adjacent bins.
+    Uses parallel processing for multiple variables.
+    """
+    if isinstance(vars_to_process, str):
+        vars_to_process = [vars_to_process]
+    
+    if n_jobs is None:
+        n_jobs = N_JOBS
+    
+    new_bins = bin_result.bin.copy()
+    var_summary = bin_result.var_summary.copy()
+    
+    # Prepare data for each variable
+    var_data = []
+    for var in vars_to_process:
+        var_bins = new_bins[(new_bins['var'] == var) & (new_bins['bin'] != 'Total')].copy()
+        var_data.append((var_bins, var, False))  # False = decreasing
+    
+    # Process in parallel
+    if len(vars_to_process) > 1 and n_jobs > 1:
+        try:
+            results = Parallel(n_jobs=n_jobs, prefer="processes", verbose=0)(
+                delayed(_process_force_trend_single_var)(vb, v, inc)
+                for vb, v, inc in var_data
+            )
+        except:
+            results = [_process_force_trend_single_var(vb, v, inc) for vb, v, inc in var_data]
+    else:
+        results = [_process_force_trend_single_var(vb, v, inc) for vb, v, inc in var_data]
+    
+    # Combine results
+    for var, working_bins, var_summary_update in results:
+        if not working_bins.empty:
+            new_bins = new_bins[new_bins['var'] != var]
+            new_bins = pd.concat([new_bins, working_bins], ignore_index=True)
+            
+            if var_summary_update is not None:
+                mask = var_summary['var'] == var
+                if mask.any():
+                    for key, value in var_summary_update.items():
+                        if key != 'var' and key in var_summary.columns:
+                            var_summary.loc[mask, key] = value
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+def _process_binned_column_single_var(
+    df: pd.DataFrame,
+    var: str,
+    var_bins: pd.DataFrame,
+    prefix: str
+) -> Tuple[str, pd.Series]:
+    """Process binned column creation for a single variable - for parallel execution."""
+    new_col_name = prefix + var
+    new_col = pd.Series(index=df.index, dtype=object)
+    new_col[:] = None
+    
+    na_rule = None
+    
+    for _, row in var_bins.iterrows():
+        rule = row['bin']
+        bin_value = rule.replace(var, '').replace(' %in% c', '').strip()
+        
+        if '| is.na' in rule:
+            na_rule = bin_value
+            main_rule = rule.split('|')[0].strip()
+        else:
+            main_rule = rule
+        
+        try:
+            if 'is.na' in main_rule and '|' not in main_rule:
+                mask = df[var].isna()
+            elif '%in%' in main_rule:
+                values = _parse_factor_values_from_rule(main_rule)
+                mask = df[var].isin(values)
+            elif '<=' in main_rule and '>' in main_rule:
+                nums = _parse_numeric_from_rule(main_rule)
+                if len(nums) >= 2:
+                    lower, upper = min(nums), max(nums)
+                    mask = (df[var] > lower) & (df[var] <= upper)
+                else:
+                    continue
+            elif '<=' in main_rule:
+                nums = _parse_numeric_from_rule(main_rule)
+                if nums:
+                    upper = max(nums)
+                    mask = df[var] <= upper
+                else:
+                    continue
+            elif '>' in main_rule:
+                nums = _parse_numeric_from_rule(main_rule)
+                if nums:
+                    lower = min(nums)
+                    mask = df[var] > lower
+                else:
+                    continue
+            elif '==' in main_rule:
+                nums = _parse_numeric_from_rule(main_rule)
+                if nums:
+                    new_col.loc[df[var] == nums[0]] = bin_value
+                continue
+            else:
+                continue
+            
+            new_col.loc[mask & df[var].notna()] = bin_value
+            
+        except Exception:
+            continue
+    
+    if na_rule is not None:
+        new_col.loc[df[var].isna()] = na_rule
+    elif df[var].isna().any():
+        na_bins = var_bins[var_bins['bin'].str.match(r'^is\.na\(', na=False)]
+        if not na_bins.empty:
+            bin_value = na_bins.iloc[0]['bin'].replace(var, '').replace(' %in% c', '').strip()
+            new_col.loc[df[var].isna()] = bin_value
+    
+    return new_col_name, new_col
+
+
+def create_binned_columns(
+    bin_result: BinResult,
+    df: pd.DataFrame,
+    x_vars: List[str],
+    prefix: str = "b_",
+    n_jobs: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    Create binned columns in the DataFrame based on binning rules.
+    Uses parallel processing for multiple variables.
+    """
+    if n_jobs is None:
+        n_jobs = N_JOBS
+    
+    result_df = df.copy()
+    
+    # Prepare data for parallel processing
+    var_data = []
+    for var in x_vars:
+        var_bins = bin_result.bin[(bin_result.bin['var'] == var) & 
+                                   (bin_result.bin['bin'] != 'Total')]
+        if not var_bins.empty:
+            var_data.append((df, var, var_bins, prefix))
+    
+    if not var_data:
+        return result_df
+    
+    # Process in parallel
+    if len(var_data) > 1 and n_jobs > 1:
+        try:
+            results = Parallel(n_jobs=n_jobs, prefer="processes", verbose=0)(
+                delayed(_process_binned_column_single_var)(d, v, vb, p)
+                for d, v, vb, p in var_data
+            )
+        except:
+            results = [_process_binned_column_single_var(d, v, vb, p) for d, v, vb, p in var_data]
+    else:
+        results = [_process_binned_column_single_var(d, v, vb, p) for d, v, vb, p in var_data]
+    
+    # Add columns to result DataFrame
+    for col_name, col_series in results:
+        result_df[col_name] = col_series
+    
+    return result_df
+
+
+def _process_woe_column_single_var(
+    df: pd.DataFrame,
+    var: str,
+    var_bins: pd.DataFrame,
+    prefix: str,
+    woe_prefix: str
+) -> Tuple[str, pd.Series]:
+    """Process WOE column creation for a single variable - for parallel execution."""
+    if 'woe' not in var_bins.columns:
+        var_bins = var_bins.copy()
+        var_bins['woe'] = calculate_woe(var_bins['goods'].values, var_bins['bads'].values)
+    
+    var_bins['binValue'] = var_bins['bin'].apply(
+        lambda x: x.replace(var, '').replace(' %in% c', '').strip()
+    )
+    
+    bin_col = prefix + var
+    woe_col = woe_prefix + var
+    
+    if bin_col in df.columns:
+        woe_map = dict(zip(var_bins['binValue'], var_bins['woe']))
+        woe_series = df[bin_col].map(woe_map)
+        return woe_col, woe_series
+    
+    return woe_col, pd.Series(index=df.index, dtype=float)
+
+
+def add_woe_columns(
+    df: pd.DataFrame,
+    bins_df: pd.DataFrame,
+    x_vars: List[str],
+    prefix: str = "b_",
+    woe_prefix: str = "WOE_",
+    n_jobs: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    Add WOE columns to the DataFrame by joining with binning rules.
+    Uses parallel processing for multiple variables.
+    """
+    if n_jobs is None:
+        n_jobs = N_JOBS
+    
+    result_df = df.copy()
+    
+    # Prepare data for parallel processing
+    var_data = []
+    for var in x_vars:
+        var_bins = bins_df[(bins_df['var'] == var) & (bins_df['bin'] != 'Total')].copy()
+        if not var_bins.empty:
+            var_data.append((df, var, var_bins, prefix, woe_prefix))
+    
+    if not var_data:
+        return result_df
+    
+    # Process in parallel
+    if len(var_data) > 1 and n_jobs > 1:
+        try:
+            results = Parallel(n_jobs=n_jobs, prefer="processes", verbose=0)(
+                delayed(_process_woe_column_single_var)(d, v, vb, p, wp)
+                for d, v, vb, p, wp in var_data
+            )
+        except:
+            results = [_process_woe_column_single_var(d, v, vb, p, wp) for d, v, vb, p, wp in var_data]
+    else:
+        results = [_process_woe_column_single_var(d, v, vb, p, wp) for d, v, vb, p, wp in var_data]
+    
+    # Add columns to result DataFrame
+    for col_name, col_series in results:
+        if not col_series.empty:
+            result_df[col_name] = col_series
+    
+    return result_df
+
+
+# =============================================================================
+# Shiny UI Application
+# =============================================================================
+
+def create_woe_editor_app(df: pd.DataFrame, min_prop: float = 0.01):
+    """Create the WOE Editor Shiny application."""
+    
+    app_results = {
+        'df_with_woe': None,
+        'df_only_woe': None,
+        'bins': None,
+        'dv': None,
+        'completed': False
+    }
+    
+    app_ui = ui.page_fluid(
+        ui.tags.head(
+            ui.tags.style("""
+                @import url('https://fonts.googleapis.com/css?family=Raleway');
+                body { font-family: 'Raleway', sans-serif; background-color: #f5f5f5; }
+                .card { background: white; border-radius: 8px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                .btn-primary { background-color: #75AFD7; border-color: #75AFD7; }
+                .btn-success { background-color: #9ECC53; border-color: #9ECC53; }
+                .btn-danger { background-color: #B5202E; border-color: #B5202E; }
+                .btn-secondary { background-color: #8A9399; border-color: #8A9399; }
+                .btn-dark { background-color: #525E66; border-color: #525E66; }
+                h4 { font-weight: bold; text-align: center; margin: 20px 0; }
+                .divider { width: 10px; display: inline-block; }
+            """)
+        ),
+        
+        ui.h4("WOE Editor (Parallel Processing Enabled)"),
+        
+        ui.div(
+            {"class": "card"},
+            ui.row(
+                ui.column(6,
+                    ui.input_select("dv", "Dependent Variable", 
+                                   choices=list(df.columns),
+                                   selected=df.columns[0] if len(df.columns) > 0 else None)
+                ),
+                ui.column(6,
+                    ui.input_select("tc", "Target Category", choices=[])
+                )
+            )
+        ),
+        
+        ui.div(
+            {"class": "card"},
+            ui.row(
+                ui.column(6,
+                    ui.input_select("iv", "Independent Variable", choices=[]),
+                    ui.div(
+                        ui.input_action_button("prev_btn", "← Previous", class_="btn btn-secondary"),
+                        ui.span(" ", class_="divider"),
+                        ui.input_action_button("next_btn", "Next →", class_="btn btn-success"),
+                    )
+                ),
+                ui.column(6,
+                    ui.div(
+                        ui.input_action_button("group_na_btn", "Group NA", class_="btn btn-primary"),
+                        ui.span(" ", class_="divider"),
+                        ui.input_action_button("break_btn", "Break Bin", class_="btn btn-danger"),
+                        ui.span(" ", class_="divider"),
+                        ui.input_action_button("reset_btn", "Reset", class_="btn btn-danger"),
+                    ),
+                    ui.br(),
+                    ui.div(
+                        ui.input_action_button("optimize_btn", "Optimize", class_="btn btn-dark"),
+                        ui.span(" ", class_="divider"),
+                        ui.input_action_button("optimize_all_btn", "Optimize All", class_="btn btn-dark"),
+                    ),
+                )
+            )
+        ),
+        
+        ui.row(
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 450px; overflow-y: auto;"},
+                    ui.h5("Bin Details"),
+                    ui.output_data_frame("woe_table")
+                )
+            ),
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 450px;"},
+                    ui.h5("WOE & Bad Rate"),
+                    output_widget("woe_graph")
+                )
+            )
+        ),
+        
+        ui.row(
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 350px;"},
+                    output_widget("count_bar")
+                )
+            ),
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 350px;"},
+                    output_widget("prop_bar")
+                )
+            )
+        ),
+        
+        ui.div(
+            {"class": "card"},
+            ui.h5("Measurements"),
+            ui.output_data_frame("measurements_table")
+        ),
+        
+        ui.div(
+            {"class": "card", "style": "text-align: center;"},
+            ui.input_action_button("run_btn", "Run & Close", class_="btn btn-success btn-lg"),
+        ),
+    )
+    
+    def server(input: Inputs, output: Outputs, session: Session):
+        bins_rv = reactive.Value(None)
+        all_bins_rv = reactive.Value(None)
+        all_bins_mod_rv = reactive.Value(None)
+        modified_action_rv = reactive.Value(False)
+        initial_bins_rv = reactive.Value(None)
+        
+        @reactive.Effect
+        @reactive.event(input.dv)
+        def update_tc():
+            dv = input.dv()
+            if dv and dv in df.columns:
+                unique_vals = df[dv].dropna().unique().tolist()
+                ui.update_select("tc", choices=unique_vals, 
+                               selected=max(unique_vals) if unique_vals else None)
+                
+                iv_list = [col for col in df.columns if col != dv]
+                
+                if df[dv].isna().sum() <= 0:
+                    try:
+                        all_bins = get_bins(df, dv, iv_list, min_prop=min_prop)
+                        all_bins_rv.set(all_bins)
+                        
+                        bin_vars = all_bins.var_summary['var'].tolist()
+                        ui.update_select("iv", choices=bin_vars, 
+                                       selected=bin_vars[0] if bin_vars else None)
+                    except Exception as e:
+                        print(f"Error calculating bins: {e}")
+        
+        @reactive.Effect
+        @reactive.event(input.iv)
+        def update_iv_bins():
+            iv = input.iv()
+            dv = input.dv()
+            if iv and dv and not modified_action_rv.get():
+                try:
+                    bins = get_bins(df, dv, [iv], min_prop=min_prop)
+                    bins_rv.set(bins)
+                    initial_bins_rv.set(bins)
+                except Exception as e:
+                    print(f"Error getting bins for {iv}: {e}")
+        
+        @reactive.Effect
+        @reactive.event(input.prev_btn)
+        def prev_var():
+            current = input.iv()
+            all_bins = all_bins_rv.get()
+            if all_bins is not None and current:
+                vars_list = all_bins.var_summary['var'].tolist()
+                if current in vars_list:
+                    idx = vars_list.index(current)
+                    if idx > 0:
+                        ui.update_select("iv", selected=vars_list[idx - 1])
+        
+        @reactive.Effect
+        @reactive.event(input.next_btn)
+        def next_var():
+            current = input.iv()
+            all_bins = all_bins_rv.get()
+            if all_bins is not None and current:
+                vars_list = all_bins.var_summary['var'].tolist()
+                if current in vars_list:
+                    idx = vars_list.index(current)
+                    if idx < len(vars_list) - 1:
+                        ui.update_select("iv", selected=vars_list[idx + 1])
+        
+        @reactive.Effect
+        @reactive.event(input.group_na_btn)
+        def group_na():
+            bins = bins_rv.get()
+            iv = input.iv()
+            if bins is not None and iv:
+                new_bins = na_combine(bins, iv)
+                bins_rv.set(new_bins)
+                modified_action_rv.set(False)
+        
+        @reactive.Effect
+        @reactive.event(input.break_btn)
+        def break_bins():
+            bins = bins_rv.get()
+            iv = input.iv()
+            dv = input.dv()
+            if bins is not None and iv and dv:
+                new_bins = break_bin(bins, iv, dv, df)
+                bins_rv.set(new_bins)
+                modified_action_rv.set(False)
+        
+        @reactive.Effect
+        @reactive.event(input.reset_btn)
+        def reset_bins():
+            iv = input.iv()
+            dv = input.dv()
+            if iv and dv:
+                modified_action_rv.set(False)
+                bins = get_bins(df, dv, [iv], min_prop=min_prop)
+                bins_rv.set(bins)
+        
+        @reactive.Effect
+        @reactive.event(input.optimize_btn)
+        def optimize_var():
+            bins = bins_rv.get()
+            iv = input.iv()
+            if bins is not None and iv:
+                var_info = bins.var_summary[bins.var_summary['var'] == iv]
+                if not var_info.empty:
+                    trend = var_info.iloc[0]['trend']
+                    if trend == 'I':
+                        new_bins = force_incr_trend(bins, iv)
+                    elif trend == 'D':
+                        new_bins = force_decr_trend(bins, iv)
+                    else:
+                        new_bins = bins
+                    bins_rv.set(new_bins)
+                    modified_action_rv.set(False)
+        
+        @reactive.Effect
+        @reactive.event(input.optimize_all_btn)
+        def optimize_all():
+            all_bins = all_bins_rv.get()
+            if all_bins is not None:
+                modified_action_rv.set(True)
+                
+                bins_mod = na_combine(all_bins, all_bins.var_summary['var'].tolist())
+                
+                decr_vars = bins_mod.var_summary[bins_mod.var_summary['trend'] == 'D']['var'].tolist()
+                if decr_vars:
+                    bins_mod = force_decr_trend(bins_mod, decr_vars)
+                
+                incr_vars = bins_mod.var_summary[bins_mod.var_summary['trend'] == 'I']['var'].tolist()
+                if incr_vars:
+                    bins_mod = force_incr_trend(bins_mod, incr_vars)
+                
+                all_bins_mod_rv.set(bins_mod)
+        
+        @reactive.Calc
+        def get_display_bins():
+            if modified_action_rv.get():
+                all_mod = all_bins_mod_rv.get()
+                iv = input.iv()
+                if all_mod is not None and iv:
+                    var_bins = all_mod.bin[all_mod.bin['var'] == iv].copy()
+                    return var_bins
+            else:
+                bins = bins_rv.get()
+                if bins is not None:
+                    return bins.bin.copy()
+            return pd.DataFrame()
+        
+        @output
+        @render.data_frame
+        def woe_table():
+            display_bins = get_display_bins()
+            if display_bins.empty:
+                return render.DataGrid(pd.DataFrame())
+            
+            non_total = display_bins[display_bins['bin'] != 'Total'].copy()
+            if not non_total.empty:
+                non_total['woe'] = calculate_woe(non_total['goods'].values, non_total['bads'].values)
+            
+            total_row = display_bins[display_bins['bin'] == 'Total'].copy()
+            if not total_row.empty:
+                total_row['woe'] = np.nan
+            
+            result = pd.concat([non_total, total_row], ignore_index=True)
+            
+            display_cols = ['bin', 'count', 'goods', 'bads', 'propn', 'bad_rate', 'woe', 'iv']
+            display_cols = [c for c in display_cols if c in result.columns]
+            
+            return render.DataGrid(result[display_cols], selection_mode="rows", height="350px")
+        
+        @output
+        @render_plotly
+        def woe_graph():
+            display_bins = get_display_bins()
+            if display_bins.empty:
+                return go.Figure()
+            
+            plot_data = display_bins[display_bins['bin'] != 'Total'].copy()
+            if plot_data.empty:
+                return go.Figure()
+            
+            plot_data['woe'] = calculate_woe(plot_data['goods'].values, plot_data['bads'].values)
+            
+            fig = go.Figure()
+            
+            fig.add_trace(go.Scatter(
+                x=plot_data['bin'], y=plot_data['bad_rate'] / 100,
+                name='Bad Rate', mode='lines+markers', line=dict(color='#3498db')
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=plot_data['bin'], y=(100 - plot_data['bad_rate']) / 100,
+                name='Good Rate', mode='lines+markers', line=dict(color='#2ecc71')
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=plot_data['bin'], y=plot_data['woe'],
+                name='WOE', mode='lines+markers', line=dict(color='#e74c3c'), yaxis='y2'
+            ))
+            
+            fig.update_layout(
+                title='WOE & Rates by Bin', xaxis_title='Bin', yaxis_title='Rate',
+                yaxis2=dict(title='WOE', overlaying='y', side='right', showgrid=False),
+                height=380, margin=dict(l=50, r=50, t=50, b=100),
+                legend=dict(orientation='h', yanchor='bottom', y=1.02)
+            )
+            
+            return fig
+        
+        @output
+        @render_plotly
+        def count_bar():
+            display_bins = get_display_bins()
+            if display_bins.empty:
+                return go.Figure()
+            
+            plot_data = display_bins[display_bins['bin'] != 'Total'].copy()
+            if plot_data.empty:
+                return go.Figure()
+            
+            plot_data['woe'] = calculate_woe(plot_data['goods'].values, plot_data['bads'].values)
+            
+            fig = go.Figure(data=[
+                go.Bar(
+                    x=plot_data['bin'], y=plot_data['count'],
+                    text=[f"Count: {c}<br>Propn: {p}%<br>WOE: {w:.4f}" 
+                          for c, p, w in zip(plot_data['count'], plot_data['propn'], plot_data['woe'])],
+                    textposition='outside', marker_color='#1F77B4'
+                )
+            ])
+            
+            fig.update_layout(
+                title='Count Distribution', xaxis_title='Bin', yaxis_title='Count',
+                height=300, margin=dict(l=50, r=50, t=50, b=100)
+            )
+            
+            return fig
+        
+        @output
+        @render_plotly
+        def prop_bar():
+            display_bins = get_display_bins()
+            if display_bins.empty:
+                return go.Figure()
+            
+            plot_data = display_bins[display_bins['bin'] != 'Total'].copy()
+            if plot_data.empty:
+                return go.Figure()
+            
+            fig = go.Figure()
+            
+            fig.add_trace(go.Bar(
+                y=plot_data['bin'], x=100 - plot_data['bad_rate'],
+                name='Good', orientation='h', marker_color='#9ECC53',
+                text=100 - plot_data['bad_rate'], textposition='inside'
+            ))
+            
+            fig.add_trace(go.Bar(
+                y=plot_data['bin'], x=plot_data['bad_rate'],
+                name='Bad', orientation='h', marker_color='#F25563',
+                text=plot_data['bad_rate'], textposition='inside'
+            ))
+            
+            fig.update_layout(
+                title='Good/Bad Proportion', barmode='stack', height=300,
+                margin=dict(l=50, r=50, t=50, b=50),
+                legend=dict(orientation='h', yanchor='bottom', y=1.02)
+            )
+            
+            return fig
+        
+        @output
+        @render.data_frame
+        def measurements_table():
+            display_bins = get_display_bins()
+            initial = initial_bins_rv.get()
+            
+            if display_bins.empty:
+                return render.DataGrid(pd.DataFrame({
+                    'Initial IV': [0], 'Final IV': [0],
+                    'Initial Entropy': [0], 'Final Entropy': [0]
+                }))
+            
+            total_row = display_bins[display_bins['bin'] == 'Total']
+            final_iv = total_row['iv'].iloc[0] if not total_row.empty else 0
+            final_ent = total_row['ent'].iloc[0] if not total_row.empty else 0
+            
+            initial_iv = 0
+            initial_ent = 0
+            if initial is not None:
+                init_total = initial.bin[initial.bin['bin'] == 'Total']
+                if not init_total.empty:
+                    initial_iv = init_total['iv'].iloc[0]
+                    initial_ent = init_total['ent'].iloc[0]
+            
+            measurements = pd.DataFrame({
+                'Initial IV': [round(initial_iv, 4)],
+                'Final IV': [round(final_iv, 4)],
+                'Initial Entropy': [round(initial_ent, 4)],
+                'Final Entropy': [round(final_ent, 4)]
+            })
+            
+            return render.DataGrid(measurements)
+        
+        @reactive.Effect
+        @reactive.event(input.run_btn)
+        async def run_and_close():
+            dv = input.dv()
+            
+            if modified_action_rv.get():
+                final_bins = all_bins_mod_rv.get()
+            else:
+                final_bins = all_bins_rv.get()
+            
+            if final_bins is None or dv is None:
+                return
+            
+            all_vars = final_bins.var_summary['var'].tolist()
+            
+            rules = final_bins.bin[final_bins.bin['bin'] != 'Total'].copy()
+            rules['woe'] = calculate_woe(rules['goods'].values, rules['bads'].values)
+            
+            for var in all_vars:
+                var_mask = rules['var'] == var
+                rules.loc[var_mask, 'binValue'] = rules.loc[var_mask, 'bin'].apply(
+                    lambda x: x.replace(var, '').replace(' %in% c', '').strip()
+                )
+            
+            df_with_bins = create_binned_columns(final_bins, df, all_vars)
+            df_with_woe = add_woe_columns(df_with_bins, rules, all_vars)
+            
+            woe_cols = [col for col in df_with_woe.columns if col.startswith('WOE_')]
+            df_only_woe = df_with_woe[woe_cols + [dv]].copy()
+            
+            app_results['df_with_woe'] = df_with_woe
+            app_results['df_only_woe'] = df_only_woe
+            app_results['bins'] = rules
+            app_results['dv'] = dv
+            app_results['completed'] = True
+            
+            await session.close()
+    
+    app = App(app_ui, server)
+    app.results = app_results
+    return app
+
+
+def run_woe_editor(df: pd.DataFrame, min_prop: float = 0.01, port: int = 8050):
+    """Run the WOE Editor application and return results."""
+    app = create_woe_editor_app(df, min_prop)
+    app.run(port=port, launch_browser=True)
+    return app.results
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+min_prop = 0.01
+
+# =============================================================================
+# Read Input Data
+# =============================================================================
+df = knio.input_tables[0].to_pandas()
+
+# =============================================================================
+# Check for Flow Variables (Headless Mode)
+# =============================================================================
+contains_dv = False
+dv = None
+target = None
+optimize_all = False
+group_na = False
+
+try:
+    dv = knio.flow_variables.get("DependentVariable", None)
+except:
+    pass
+
+try:
+    target = knio.flow_variables.get("TargetCategory", None)
+except:
+    pass
+
+try:
+    optimize_all = knio.flow_variables.get("OptimizeAll", False)
+except:
+    pass
+
+try:
+    group_na = knio.flow_variables.get("GroupNA", False)
+except:
+    pass
+
+if dv is not None and isinstance(dv, str) and len(dv) > 0 and dv != "missing":
+    if dv in df.columns:
+        contains_dv = True
+
+# =============================================================================
+# Main Processing Logic
+# =============================================================================
+
+if contains_dv:
+    # =========================================================================
+    # HEADLESS MODE (with parallel processing)
+    # =========================================================================
+    print(f"Running in headless mode with DV: {dv}")
+    print(f"[Parallel] Parallel processing enabled with {N_JOBS} workers")
+    
+    iv_list = [col for col in df.columns if col != dv]
+    bins_result = get_bins(df, dv, iv_list, min_prop=min_prop)
+    
+    if group_na:
+        bins_result = na_combine(bins_result, bins_result.var_summary['var'].tolist())
+    
+    if optimize_all:
+        bins_mod = na_combine(bins_result, bins_result.var_summary['var'].tolist())
+        
+        decr_vars = bins_mod.var_summary[bins_mod.var_summary['trend'] == 'D']['var'].tolist()
+        if decr_vars:
+            bins_mod = force_decr_trend(bins_mod, decr_vars)
+        
+        incr_vars = bins_mod.var_summary[bins_mod.var_summary['trend'] == 'I']['var'].tolist()
+        if incr_vars:
+            bins_mod = force_incr_trend(bins_mod, incr_vars)
+        
+        bins_result = bins_mod
+    
+    rules = bins_result.bin[bins_result.bin['bin'] != 'Total'].copy()
+    rules['woe'] = calculate_woe(rules['goods'].values, rules['bads'].values)
+    
+    for var in bins_result.var_summary['var'].tolist():
+        var_mask = rules['var'] == var
+        rules.loc[var_mask, 'binValue'] = rules.loc[var_mask, 'bin'].apply(
+            lambda x: x.replace(var, '').replace(' %in% c', '').strip()
+        )
+    
+    all_vars = bins_result.var_summary['var'].tolist()
+    df_with_bins = create_binned_columns(bins_result, df, all_vars)
+    df_with_woe = add_woe_columns(df_with_bins, rules, all_vars)
+    
+    woe_cols = [col for col in df_with_woe.columns if col.startswith('WOE_')]
+    df_only_woe = df_with_woe[woe_cols + [dv]].copy()
+    
+    bins = rules
+    
+    print(f"Processed {len(all_vars)} variables")
+
+else:
+    # =========================================================================
+    # INTERACTIVE MODE
+    # =========================================================================
+    print("Running in interactive mode - launching Shiny UI...")
+    print(f"[Parallel] Parallel processing enabled with {N_JOBS} workers")
+    
+    results = run_woe_editor(df, min_prop=min_prop)
+    
+    if results['completed']:
+        df_with_woe = results['df_with_woe']
+        df_only_woe = results['df_only_woe']
+        bins = results['bins']
+        dv = results['dv']
+        print("Interactive session completed successfully")
+    else:
+        print("Interactive session cancelled - returning empty results")
+        df_with_woe = df.copy()
+        df_only_woe = pd.DataFrame()
+        bins = pd.DataFrame()
+
+# =============================================================================
+# Output Tables
+# =============================================================================
+
+# Output 1: Original input DataFrame (unchanged)
+knio.output_tables[0] = knio.Table.from_pandas(df)
+
+# Output 2: df_with_woe - Original data + binned columns + WOE columns
+knio.output_tables[1] = knio.Table.from_pandas(df_with_woe)
+
+# Output 3: df_only_woe - Only WOE columns + dependent variable
+knio.output_tables[2] = knio.Table.from_pandas(df_only_woe)
+
+# Output 4: bins - Binning rules with WOE values
+knio.output_tables[3] = knio.Table.from_pandas(bins)
+
+print("WOE Editor (Parallel) completed successfully")
+

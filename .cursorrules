@@ -1,0 +1,125 @@
+# KNIME Python Nodes Project
+
+## Project Overview
+This project contains Python scripts designed to run inside KNIME 5.9 Python Script nodes. The scripts are self-contained and use the `knime.scripting.io` package for data I/O.
+
+## Environment
+- **KNIME Version**: 5.9
+- **Python Version**: 3.9.23
+- **Platform**: Windows
+
+## Scripts
+
+### 1. reject_inference.py
+**Purpose**: Reject inference for credit scoring models. Creates new columns with inferred values for rejected loan applications.
+
+**Columns Generated**:
+- `isFPD_wRI` (Int32): First Payment Default with Reject Inference
+  - If LoanID exists: uses `IsFPD` value
+  - If LoanID missing: uses `FPD` value, or random assignment based on `expected_DefaultRate2`
+- `FRODI26_wRI` (Float64): FRODI26 with Reject Inference
+  - Uses original value if present, otherwise uses average based on isFPD_wRI
+- `GRODI26_wRI` (Float64): GRODI26 with Reject Inference
+  - Uses original value if present, otherwise uses average based on isFPD_wRI
+
+**Input**: Single table with columns: LoanID, IsFPD, FPD, expected_DefaultRate2, FRODI26, GRODI26
+**Output**: Same table with new columns inserted after their source columns
+
+### 2. woe_editor_knime.py (Base Version)
+**Purpose**: Weight of Evidence (WOE) binning editor. Python implementation of R's logiBin package with Shiny UI.
+
+**Two Modes**:
+1. **Interactive Mode** (no flow variables): Opens Shiny web UI in browser for manual bin editing
+2. **Headless Mode** (with flow variables): Automatic processing without UI
+
+**Flow Variables** (for headless mode):
+- `DependentVariable` (string): Name of the binary target variable
+- `TargetCategory` (optional): Which value represents the "bad" outcome
+- `OptimizeAll` (boolean): Force monotonic trends on all variables
+- `GroupNA` (boolean): Combine NA bins with closest bin
+
+**Four Outputs**:
+1. Original input DataFrame (unchanged)
+2. `df_with_woe`: Original + binned columns (`b_*`) + WOE columns (`WOE_*`)
+3. `df_only_woe`: Only WOE columns + dependent variable
+4. `bins`: Binning rules with WOE values
+
+### 3. woe_editor_advanced.py (RECOMMENDED)
+**Purpose**: Advanced WOE binning with multiple algorithms and enhancements.
+
+**Algorithm Options**:
+- `DecisionTree` (default): R-compatible, matches logiBin::getBins
+- `ChiMerge`: Chi-square based bin merging
+- `IVOptimal`: Maximizes Information Value, allows non-monotonic patterns (sweet spots)
+
+**Key Flow Variables**:
+- `DependentVariable` (string): Target column name (triggers headless mode)
+- `Algorithm` (string): "DecisionTree", "ChiMerge", or "IVOptimal"
+- `MinBinPct` (float): Minimum bin proportion (default 0.02)
+- `MaxBins` (int): Maximum bins per variable (default 10)
+- `OptimizeAll` (int): Force monotonicity (0=no, 1=yes)
+- `UseEnhancements` (boolean): Enable all DecisionTree enhancements
+- Individual flags: `AdaptiveMinProp`, `MinEventCount`, `AutoRetry`, `ChiSquareValidation`, `SingleBinProtection`
+
+**IVOptimal Algorithm** (best for fraud models):
+- Directly maximizes IV during binning
+- Does NOT enforce monotonicity - preserves "sweet spots"
+- Dynamic starting granularity based on variable characteristics
+- Merges pure bins to closest adjacent by WOE value
+
+**Documentation**: See `WOE node files/WOE_Editor_Enhancements.md`
+**Config Generator**: Use `WOE node files/woe_config_generator.py` to create flow variable tables
+
+**Key Functions Implemented**:
+- `get_bins()` - Optimal binning using decision trees (like logiBin::getBins)
+- `calculate_woe()` - Weight of Evidence calculation
+- `calculate_iv()` - Information Value calculation
+- `na_combine()` - Combine NA with closest bin
+- `force_incr_trend()` / `force_decr_trend()` - Force monotonic trends
+- `create_binned_columns()` - Apply bins to create b_* columns
+- `add_woe_columns()` - Create WOE_* columns
+- `_iv_optimal_get_splits()` - IV-maximizing binning algorithm
+
+## KNIME Python Script Patterns
+
+### Reading Input
+```python
+import knime.scripting.io as knio
+df = knio.input_tables[0].to_pandas()
+```
+
+### Writing Output
+```python
+knio.output_tables[0] = knio.Table.from_pandas(df)
+```
+
+### Reading Flow Variables
+```python
+try:
+    var = knio.flow_variables.get("VariableName", default_value)
+except:
+    var = default_value
+```
+
+### Data Types
+- Use `Int32` for integers (maps to KNIME Number (Integer))
+- Use `Int64` for long integers (maps to KNIME Number (Long))
+- Use `Float64` for decimals (maps to KNIME Number (Double))
+- Use pandas nullable types (`Int32`, `Float64`) to allow missing values
+
+## Code Style Guidelines
+- All scripts should be self-contained (no external module imports from project)
+- Auto-install dependencies if missing using subprocess + pip
+- Column names are case-sensitive
+- Place new columns after their source columns when possible
+- Use descriptive comments and section headers
+
+## Dependencies
+Scripts auto-install these if missing:
+- pandas
+- numpy
+- scikit-learn
+- shiny
+- shinywidgets
+- plotly
+

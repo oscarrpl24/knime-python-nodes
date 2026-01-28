@@ -1,0 +1,17 @@
+# How to run Scorecard node in HEADLESS mode (no browser UI)
+
+Add a "Table Creator" node before the Scorecard node with these flow variables:
+
+| Flow Variable Name | Type   | Value | Description                    |
+|--------------------|--------|-------|--------------------------------|
+| Points             | int    | 600   | Base score at target odds      |
+| Odds               | int    | 20    | Odds ratio (1:X format)        |
+| PDO                | int    | 50    | Points to Double the Odds      |
+
+Connect the Table Creator's "Variable" output port to the Scorecard node's "Variable" input port.
+
+This will run automatically without opening a browser window.
+
+Example values:
+- Points=600, Odds=20, PDO=50 (common credit scoring settings)
+- Points=500, Odds=10, PDO=20 (stricter scoring)
