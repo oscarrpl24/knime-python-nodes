@@ -2282,3 +2282,1003 @@ def get_bins(
     var_summary_df = pd.DataFrame(var_summaries)
     
     return BinResult(var_summary=var_summary_df, bin=combined_bins)
+
+
+def manual_split(
+    bin_result: BinResult,
+    var: str,
+    y_var: str,
+    splits: List[float],
+    df: pd.DataFrame
+) -> BinResult:
+    """
+    Manually split a numeric variable at specified points.
+    
+    This function allows users to override the automatic binning by providing
+    explicit split points. Useful when domain knowledge suggests specific
+    cut points (e.g., age 18 for legal adult, income thresholds, etc.)
+    
+    Parameters:
+        bin_result (BinResult): The current binning results to modify.
+        var (str): Name of the variable to re-bin.
+        y_var (str): Name of the binary target variable.
+        splits (List[float]): User-specified split points.
+        df (pd.DataFrame): The data to use for calculating statistics.
+    
+    Returns:
+        BinResult: Updated binning results with the new bins for this variable.
+    """
+    # Create new bins using the manual splits
+    bin_df = _create_numeric_bins(df, var, y_var, splits)
+    
+    # If creation failed, return original
+    if bin_df.empty:
+        return bin_result
+    
+    # Add statistics to the new bins
+    bin_df = update_bin_stats(bin_df)
+    bin_df = add_total_row(bin_df, var)
+    
+    # Remove old bins for this variable, keep bins for other variables
+    other_bins = bin_result.bin[bin_result.bin['var'] != var].copy()
+    
+    # Combine: other variables' bins + new bins for this variable
+    new_bins = pd.concat([other_bins, bin_df], ignore_index=True)
+    
+    # Update the variable summary
+    total_row = bin_df[bin_df['bin'] == 'Total'].iloc[0]
+    var_summary = bin_result.var_summary.copy()
+    
+    # Find and update the row for this variable
+    mask = var_summary['var'] == var
+    if mask.any():
+        var_summary.loc[mask, 'iv'] = total_row['iv']
+        var_summary.loc[mask, 'ent'] = total_row['ent']
+        var_summary.loc[mask, 'trend'] = total_row['trend']
+        var_summary.loc[mask, 'monTrend'] = total_row.get('monTrend', 'N')
+        var_summary.loc[mask, 'flipRatio'] = total_row.get('flipRatio', 0)
+        var_summary.loc[mask, 'numBins'] = total_row.get('numBins', len(bin_df) - 1)
+        var_summary.loc[mask, 'purNode'] = total_row['purNode']
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+# =============================================================================
+# Bin Operations Functions
+# =============================================================================
+# These functions provide operations to manipulate bins after initial creation,
+# such as parsing bin rules, combining NA bins, merging pure bins, etc.
+
+def _parse_numeric_from_rule(rule: str) -> List[float]:
+    """
+    Extract numeric values from a bin rule string.
+    
+    Bin rules contain numeric values in single quotes, like:
+    "Age > '30' & Age <= '50'"
+    
+    This function uses regex to extract all such values.
+    
+    Parameters:
+        rule (str): A bin rule string.
+    
+    Returns:
+        List[float]: List of numeric values found in the rule.
+    
+    Example:
+        _parse_numeric_from_rule("Age > '30' & Age <= '50'") -> [30.0, 50.0]
+    """
+    # Regex pattern to match numbers in single quotes
+    # Pattern breakdown:
+    # '    - literal single quote
+    # (    - start capture group
+    # -?   - optional negative sign
+    # \d+  - one or more digits
+    # \.?  - optional decimal point
+    # \d*  - zero or more digits after decimal
+    # )    - end capture group
+    # '    - literal single quote
+    pattern = r"'(-?\d+\.?\d*)'"
+    
+    # Find all matches and convert to float
+    matches = re.findall(pattern, rule)
+    return [float(m) for m in matches]
+
+
+def _parse_factor_values_from_rule(rule: str) -> List[str]:
+    """
+    Extract factor (categorical) values from a bin rule string.
+    
+    Factor bin rules contain category values in double quotes, like:
+    'State %in% c("CA", "NY", "TX")'
+    
+    This function uses regex to extract all such values.
+    
+    Parameters:
+        rule (str): A bin rule string.
+    
+    Returns:
+        List[str]: List of category values found in the rule.
+    
+    Example:
+        _parse_factor_values_from_rule('State %in% c("CA", "NY")') -> ["CA", "NY"]
+    """
+    # Regex pattern to match values in double quotes
+    # Pattern: anything between double quotes that isn't a double quote
+    pattern = r'"([^"]*)"'
+    
+    # Find all matches
+    matches = re.findall(pattern, rule)
+    return matches
+
+
+def na_combine(
+    bin_result: BinResult,
+    vars_to_process: Union[str, List[str]],
+    prevent_single_bin: bool = True
+) -> BinResult:
+    """
+    Combine NA (missing value) bin with the adjacent bin that has the closest bad rate.
+    
+    This function merges the NA bin into an existing bin to reduce the number of bins
+    and simplify the model. The NA bin is merged with whichever non-NA bin has the
+    most similar bad rate (risk profile).
+    
+    Parameters:
+        bin_result (BinResult): BinResult with binning information.
+        vars_to_process (Union[str, List[str]]): Variables to process.
+        prevent_single_bin (bool): If True, skip combining if it would result in 
+                                   a single bin (which would have WOE=0 everywhere).
+    
+    Returns:
+        BinResult: Updated binning results with NA bins merged.
+    """
+    # Convert single string to list for uniform processing
+    if isinstance(vars_to_process, str):
+        vars_to_process = [vars_to_process]
+    
+    # Make copies to avoid modifying original
+    new_bins = bin_result.bin.copy()
+    var_summary = bin_result.var_summary.copy()
+    skipped_single_bin = []  # Track variables skipped due to single-bin protection
+    
+    # Process each variable
+    for var in vars_to_process:
+        # Get bins for this variable
+        var_bins = new_bins[new_bins['var'] == var].copy()
+        
+        # Skip if no bins for this variable
+        if var_bins.empty:
+            continue
+        
+        # Find NA bin(s) - bins whose rule contains 'is.na'
+        na_mask = var_bins['bin'].str.contains('is.na', regex=False, na=False)
+        
+        # If no NA bin, nothing to combine
+        if not na_mask.any():
+            continue
+        
+        # Get the NA bin and non-NA bins
+        na_bin = var_bins[na_mask].iloc[0]
+        non_na_bins = var_bins[~na_mask & (var_bins['bin'] != 'Total')]
+        
+        # Skip if no non-NA bins to merge with
+        if non_na_bins.empty:
+            continue
+        
+        # Protection: prevent creating single-bin variables (which have WOE=0)
+        # If there's only one non-NA bin, merging NA would leave just one bin
+        if prevent_single_bin and len(non_na_bins) <= 1:
+            skipped_single_bin.append(var)
+            continue
+        
+        # Calculate bad rate for NA bin
+        na_bad_rate = na_bin['bads'] / na_bin['count'] if na_bin['count'] > 0 else 0
+        
+        # Calculate bad rate for each non-NA bin and find closest
+        non_na_bins = non_na_bins.copy()
+        non_na_bins['bad_rate_calc'] = non_na_bins['bads'] / non_na_bins['count']
+        non_na_bins['rate_diff'] = abs(non_na_bins['bad_rate_calc'] - na_bad_rate)
+        
+        # Find the bin with closest bad rate
+        closest_idx = non_na_bins['rate_diff'].idxmin()
+        closest_bin = non_na_bins.loc[closest_idx]
+        
+        # Create combined rule: original rule | is.na(var)
+        combined_rule = f"{closest_bin['bin']} | is.na({var})"
+        
+        # Sum the counts
+        combined_count = closest_bin['count'] + na_bin['count']
+        combined_goods = closest_bin['goods'] + na_bin['goods']
+        combined_bads = closest_bin['bads'] + na_bin['bads']
+        
+        # Update the closest bin with combined values
+        new_bins.loc[closest_idx, 'bin'] = combined_rule
+        new_bins.loc[closest_idx, 'count'] = combined_count
+        new_bins.loc[closest_idx, 'goods'] = combined_goods
+        new_bins.loc[closest_idx, 'bads'] = combined_bads
+        
+        # Remove the NA bin
+        na_idx = var_bins[na_mask].index[0]
+        new_bins = new_bins.drop(na_idx)
+        
+        # Recalculate statistics for this variable
+        var_new_bins = new_bins[(new_bins['var'] == var) & (new_bins['bin'] != 'Total')].copy()
+        var_new_bins = update_bin_stats(var_new_bins)
+        var_new_bins = add_total_row(var_new_bins, var)
+        
+        # Replace all bins for this variable with updated ones
+        new_bins = new_bins[new_bins['var'] != var]
+        new_bins = pd.concat([new_bins, var_new_bins], ignore_index=True)
+        
+        # Update variable summary
+        total_row = var_new_bins[var_new_bins['bin'] == 'Total'].iloc[0]
+        mask = var_summary['var'] == var
+        if mask.any():
+            var_summary.loc[mask, 'iv'] = total_row['iv']
+            var_summary.loc[mask, 'ent'] = total_row['ent']
+            var_summary.loc[mask, 'trend'] = total_row['trend']
+            var_summary.loc[mask, 'monTrend'] = total_row.get('monTrend', 'N')
+            var_summary.loc[mask, 'flipRatio'] = total_row.get('flipRatio', 0)
+            var_summary.loc[mask, 'numBins'] = total_row.get('numBins', len(var_new_bins) - 1)
+            var_summary.loc[mask, 'purNode'] = total_row['purNode']
+    
+    # Log skipped variables (would have become single-bin with WOE=0)
+    if skipped_single_bin:
+        log_progress(f"  - Skipped NA grouping for {len(skipped_single_bin)} variables (would create single-bin WOE=0)")
+        if len(skipped_single_bin) <= 10:
+            log_progress(f"    Skipped vars: {skipped_single_bin}")
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+def validate_bins_chi_square(
+    bin_result: BinResult,
+    vars_to_process: Union[str, List[str]] = None,
+    p_value_threshold: float = 0.05
+) -> BinResult:
+    """
+    ENHANCEMENT: Validate that adjacent bins are statistically different using chi-square test.
+    
+    This function merges adjacent bins that are not significantly different,
+    preventing over-binning where splits don't add meaningful predictive power.
+    
+    The chi-square test compares the good/bad distribution between adjacent bins.
+    If the p-value is above the threshold (not significantly different),
+    the bins are merged.
+    
+    Parameters:
+        bin_result (BinResult): BinResult with binning information.
+        vars_to_process (Union[str, List[str]]): Variables to process (default: all).
+        p_value_threshold (float): Merge bins if p-value > threshold (default 0.05).
+    
+    Returns:
+        BinResult: Updated binning results with validated bins.
+    """
+    # Default to all variables if not specified
+    if vars_to_process is None:
+        vars_to_process = bin_result.var_summary['var'].tolist()
+    elif isinstance(vars_to_process, str):
+        vars_to_process = [vars_to_process]
+    
+    new_bins = bin_result.bin.copy()
+    var_summary = bin_result.var_summary.copy()
+    merged_count = 0  # Track number of merges for logging
+    
+    for var in vars_to_process:
+        # Get bins for this variable (excluding Total row)
+        var_bins = new_bins[(new_bins['var'] == var) & (new_bins['bin'] != 'Total')].copy()
+        
+        # Skip if too few bins
+        if var_bins.empty or len(var_bins) <= 2:
+            continue
+        
+        # Separate NA bin (treat it specially)
+        na_mask = var_bins['bin'].str.contains('is.na', regex=False, na=False)
+        na_bin = var_bins[na_mask].copy() if na_mask.any() else pd.DataFrame()
+        working_bins = var_bins[~na_mask].copy().reset_index(drop=True)
+        
+        # Need at least 3 non-NA bins to potentially merge
+        if len(working_bins) <= 2:
+            continue
+        
+        # Iteratively merge bins that aren't significantly different
+        changed = True
+        while changed and len(working_bins) > 2:
+            changed = False
+            
+            for i in range(len(working_bins) - 1):
+                # Create 2x2 contingency table for chi-square test
+                # Rows: bin i, bin i+1
+                # Columns: goods, bads
+                observed = np.array([
+                    [working_bins.iloc[i]['goods'], working_bins.iloc[i]['bads']],
+                    [working_bins.iloc[i+1]['goods'], working_bins.iloc[i+1]['bads']]
+                ])
+                
+                # Skip if any row has zero total (can't compute chi-square)
+                if observed.sum() == 0 or any(observed.sum(axis=1) == 0):
+                    continue
+                
+                # Perform chi-square test
+                try:
+                    chi2, p_value, dof, expected = stats.chi2_contingency(observed)
+                except:
+                    continue
+                
+                # If p-value > threshold, bins are not significantly different - merge them
+                if p_value > p_value_threshold:
+                    # Merge bins i and i+1
+                    working_bins.iloc[i, working_bins.columns.get_loc('count')] += working_bins.iloc[i+1]['count']
+                    working_bins.iloc[i, working_bins.columns.get_loc('goods')] += working_bins.iloc[i+1]['goods']
+                    working_bins.iloc[i, working_bins.columns.get_loc('bads')] += working_bins.iloc[i+1]['bads']
+                    
+                    # Update bin rule to cover both ranges
+                    old_rule = working_bins.iloc[i]['bin']
+                    new_rule = working_bins.iloc[i+1]['bin']
+                    
+                    # Try to extend the upper bound in the rule
+                    if '<=' in new_rule:
+                        nums = re.findall(r"'(-?\d+\.?\d*)'", new_rule)
+                        if nums:
+                            new_upper = max(float(n) for n in nums)
+                            if '>' in old_rule and '<=' in old_rule:
+                                old_nums = re.findall(r"'(-?\d+\.?\d*)'", old_rule.split('&')[0])
+                                if old_nums:
+                                    working_bins.iloc[i, working_bins.columns.get_loc('bin')] = f"{var} > '{min(float(n) for n in old_nums)}' & {var} <= '{new_upper}'"
+                            elif '<=' in old_rule:
+                                working_bins.iloc[i, working_bins.columns.get_loc('bin')] = f"{var} <= '{new_upper}'"
+                    
+                    # Remove the merged bin
+                    working_bins = working_bins.drop(working_bins.index[i+1]).reset_index(drop=True)
+                    changed = True
+                    merged_count += 1
+                    break
+        
+        # Reconstruct variable bins (add back NA bin if it existed)
+        if not na_bin.empty:
+            working_bins = pd.concat([working_bins, na_bin], ignore_index=True)
+        
+        # Recalculate statistics
+        working_bins = update_bin_stats(working_bins)
+        working_bins = add_total_row(working_bins, var)
+        
+        # Replace bins for this variable
+        new_bins = new_bins[new_bins['var'] != var]
+        new_bins = pd.concat([new_bins, working_bins], ignore_index=True)
+        
+        # Update variable summary
+        total_row = working_bins[working_bins['bin'] == 'Total'].iloc[0]
+        mask = var_summary['var'] == var
+        if mask.any():
+            var_summary.loc[mask, 'iv'] = total_row['iv']
+            var_summary.loc[mask, 'numBins'] = total_row.get('numBins', len(working_bins) - 1)
+    
+    # Log results
+    if merged_count > 0:
+        log_progress(f"  - Chi-square validation: merged {merged_count} statistically similar bin pairs")
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+def merge_pure_bins(
+    bin_result: BinResult,
+    vars_to_process: Union[str, List[str]] = None
+) -> BinResult:
+    """
+    Merge pure bins (100% goods or 100% bads) with the closest non-pure bin.
+    
+    Pure bins cause infinite WOE values (division by zero) which break logistic
+    regression. This function iteratively merges pure bins until no pure bins remain.
+    
+    Parameters:
+        bin_result (BinResult): BinResult with binning information.
+        vars_to_process (Union[str, List[str]]): Variables to process (default: all).
+    
+    Returns:
+        BinResult: Updated binning results with pure bins merged.
+    """
+    # Default to all variables if not specified
+    if vars_to_process is None:
+        vars_to_process = bin_result.var_summary['var'].tolist()
+    elif isinstance(vars_to_process, str):
+        vars_to_process = [vars_to_process]
+    
+    new_bins = bin_result.bin.copy()
+    var_summary = bin_result.var_summary.copy()
+    
+    for var in vars_to_process:
+        max_iterations = 100  # Safety limit to prevent infinite loops
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Get current bins for this variable
+            var_bins = new_bins[(new_bins['var'] == var) & (new_bins['bin'] != 'Total')].copy()
+            
+            # If only one bin left, can't merge further
+            if len(var_bins) <= 1:
+                break
+            
+            # Find pure bins (goods=0 or bads=0)
+            pure_mask = (var_bins['goods'] == 0) | (var_bins['bads'] == 0)
+            
+            # If no pure bins, we're done with this variable
+            if not pure_mask.any():
+                break
+            
+            # Get the first pure bin
+            pure_bin = var_bins[pure_mask].iloc[0]
+            pure_idx = var_bins[pure_mask].index[0]
+            
+            # Find non-pure bins to merge with
+            non_pure_bins = var_bins[~pure_mask]
+            
+            if non_pure_bins.empty:
+                # All bins are pure - merge the two with closest counts
+                other_bins = var_bins[var_bins.index != pure_idx]
+                if other_bins.empty:
+                    break
+                other_bins = other_bins.copy()
+                other_bins['count_diff'] = abs(other_bins['count'] - pure_bin['count'])
+                closest_idx = other_bins['count_diff'].idxmin()
+                closest_bin = other_bins.loc[closest_idx]
+            else:
+                # Calculate bad rate for pure bin (0 or 1)
+                pure_bad_rate = pure_bin['bads'] / pure_bin['count'] if pure_bin['count'] > 0 else 0.5
+                
+                # Find closest non-pure bin by bad rate
+                non_pure_bins = non_pure_bins.copy()
+                non_pure_bins['bad_rate_calc'] = non_pure_bins['bads'] / non_pure_bins['count']
+                non_pure_bins['rate_diff'] = abs(non_pure_bins['bad_rate_calc'] - pure_bad_rate)
+                
+                closest_idx = non_pure_bins['rate_diff'].idxmin()
+                closest_bin = non_pure_bins.loc[closest_idx]
+            
+            # Merge the pure bin into the closest bin
+            combined_rule = f"({closest_bin['bin']}) | ({pure_bin['bin']})"
+            combined_count = closest_bin['count'] + pure_bin['count']
+            combined_goods = closest_bin['goods'] + pure_bin['goods']
+            combined_bads = closest_bin['bads'] + pure_bin['bads']
+            
+            # Update the closest bin
+            new_bins.loc[closest_idx, 'bin'] = combined_rule
+            new_bins.loc[closest_idx, 'count'] = combined_count
+            new_bins.loc[closest_idx, 'goods'] = combined_goods
+            new_bins.loc[closest_idx, 'bads'] = combined_bads
+            
+            # Remove the pure bin
+            new_bins = new_bins.drop(pure_idx)
+        
+        # Recalculate stats for this variable
+        var_new_bins = new_bins[(new_bins['var'] == var) & (new_bins['bin'] != 'Total')].copy()
+        if not var_new_bins.empty:
+            var_new_bins = update_bin_stats(var_new_bins)
+            var_new_bins = add_total_row(var_new_bins, var)
+            
+            # Replace variable bins
+            new_bins = new_bins[new_bins['var'] != var]
+            new_bins = pd.concat([new_bins, var_new_bins], ignore_index=True)
+            
+            # Update variable summary
+            total_row = var_new_bins[var_new_bins['bin'] == 'Total'].iloc[0]
+            mask = var_summary['var'] == var
+            if mask.any():
+                var_summary.loc[mask, 'iv'] = total_row['iv']
+                var_summary.loc[mask, 'ent'] = total_row['ent']
+                var_summary.loc[mask, 'trend'] = total_row['trend']
+                var_summary.loc[mask, 'monTrend'] = total_row.get('monTrend', 'N')
+                var_summary.loc[mask, 'flipRatio'] = total_row.get('flipRatio', 0)
+                var_summary.loc[mask, 'numBins'] = total_row.get('numBins', len(var_new_bins) - 1)
+                var_summary.loc[mask, 'purNode'] = 'N'  # No more pure nodes after merging
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+def break_bin(
+    bin_result: BinResult,
+    var: str,
+    y_var: str,
+    df: pd.DataFrame
+) -> BinResult:
+    """
+    Break all bins for a factor variable - each unique value becomes its own bin.
+    
+    This function resets a categorical variable's binning so that each unique
+    category gets its own bin. Useful when you want to start over with a
+    variable's binning.
+    
+    Parameters:
+        bin_result (BinResult): The current binning results.
+        var (str): Name of the variable to break.
+        y_var (str): Name of the binary target variable.
+        df (pd.DataFrame): The data to use.
+    
+    Returns:
+        BinResult: Updated binning results with broken bins.
+    """
+    # Create new bins - each unique value gets its own bin
+    new_var_bins = _create_factor_bins(df, var, y_var, 
+                                       max_categories=BinningConfig.MAX_CATEGORIES,
+                                       max_bins=BinningConfig.MAX_BINS)
+    
+    # Add statistics
+    new_var_bins = update_bin_stats(new_var_bins)
+    new_var_bins = add_total_row(new_var_bins, var)
+    
+    # Replace bins for this variable
+    other_bins = bin_result.bin[bin_result.bin['var'] != var].copy()
+    new_bins = pd.concat([other_bins, new_var_bins], ignore_index=True)
+    
+    # Update variable summary
+    total_row = new_var_bins[new_var_bins['bin'] == 'Total'].iloc[0]
+    var_summary = bin_result.var_summary.copy()
+    mask = var_summary['var'] == var
+    if mask.any():
+        var_summary.loc[mask, 'iv'] = total_row['iv']
+        var_summary.loc[mask, 'ent'] = total_row['ent']
+        var_summary.loc[mask, 'trend'] = total_row['trend']
+        var_summary.loc[mask, 'monTrend'] = total_row.get('monTrend', 'N')
+        var_summary.loc[mask, 'flipRatio'] = total_row.get('flipRatio', 0)
+        var_summary.loc[mask, 'numBins'] = total_row.get('numBins', len(new_var_bins) - 1)
+        var_summary.loc[mask, 'purNode'] = total_row['purNode']
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+def force_incr_trend(
+    bin_result: BinResult,
+    vars_to_process: Union[str, List[str]]
+) -> BinResult:
+    """
+    Force an increasing monotonic trend in bad rates by combining adjacent bins.
+    
+    This function merges bins until bad rates are strictly increasing from
+    low to high bin values. This is often desired in credit scoring for
+    business interpretability.
+    
+    Parameters:
+        bin_result (BinResult): Current binning results.
+        vars_to_process (Union[str, List[str]]): Variables to process.
+    
+    Returns:
+        BinResult: Updated binning results with monotonically increasing bad rates.
+    """
+    # Convert single string to list
+    if isinstance(vars_to_process, str):
+        vars_to_process = [vars_to_process]
+    
+    new_bins = bin_result.bin.copy()
+    var_summary = bin_result.var_summary.copy()
+    
+    for var in vars_to_process:
+        # Get bins for this variable
+        var_bins = new_bins[(new_bins['var'] == var) & (new_bins['bin'] != 'Total')].copy()
+        
+        # Skip if not enough bins
+        if var_bins.empty or len(var_bins) < 2:
+            continue
+        
+        # Separate NA bin (handle separately)
+        na_mask = var_bins['bin'].str.contains('is.na', regex=False, na=False)
+        na_bin = var_bins[na_mask].copy() if na_mask.any() else pd.DataFrame()
+        working_bins = var_bins[~na_mask].copy()
+        
+        if working_bins.empty:
+            continue
+        
+        working_bins = working_bins.reset_index(drop=True)
+        
+        # Iteratively merge bins that violate increasing trend
+        changed = True
+        while changed and len(working_bins) > 1:
+            changed = False
+            
+            # Calculate current bad rates
+            working_bins['bad_rate_calc'] = working_bins['bads'] / working_bins['count']
+            
+            # Find first violation (bad rate decreases)
+            for i in range(1, len(working_bins)):
+                if working_bins.iloc[i]['bad_rate_calc'] < working_bins.iloc[i-1]['bad_rate_calc']:
+                    # Merge bin i with bin i-1
+                    working_bins.iloc[i-1, working_bins.columns.get_loc('count')] += working_bins.iloc[i]['count']
+                    working_bins.iloc[i-1, working_bins.columns.get_loc('goods')] += working_bins.iloc[i]['goods']
+                    working_bins.iloc[i-1, working_bins.columns.get_loc('bads')] += working_bins.iloc[i]['bads']
+                    
+                    # Update the bin rule to cover both ranges
+                    old_rule = working_bins.iloc[i-1]['bin']
+                    new_rule = working_bins.iloc[i]['bin']
+                    
+                    # Try to extend the upper bound
+                    if '<=' in new_rule:
+                        new_upper = _parse_numeric_from_rule(new_rule)
+                        if new_upper:
+                            max_upper = max(new_upper)
+                            if '<=' in old_rule and '>' in old_rule:
+                                lower_vals = _parse_numeric_from_rule(old_rule.split('&')[0]) if '&' in old_rule else []
+                                if lower_vals:
+                                    working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} > '{min(lower_vals)}' & {var} <= '{max_upper}'"
+                                else:
+                                    working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} <= '{max_upper}'"
+                            elif '<=' in old_rule:
+                                working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} <= '{max_upper}'"
+                    elif '>' in new_rule and '<=' not in new_rule:
+                        if '>' in old_rule:
+                            old_lower = _parse_numeric_from_rule(old_rule.split('&')[0]) if '&' in old_rule else _parse_numeric_from_rule(old_rule)
+                            if old_lower:
+                                working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} > '{min(old_lower)}'"
+                    
+                    # Remove the merged bin
+                    working_bins = working_bins.drop(working_bins.index[i]).reset_index(drop=True)
+                    changed = True
+                    break
+        
+        # Add back NA bin if it existed
+        if not na_bin.empty:
+            working_bins = pd.concat([working_bins, na_bin], ignore_index=True)
+        
+        # Remove temporary calculation column
+        if 'bad_rate_calc' in working_bins.columns:
+            working_bins = working_bins.drop('bad_rate_calc', axis=1)
+        
+        # Recalculate statistics
+        working_bins = update_bin_stats(working_bins)
+        working_bins = add_total_row(working_bins, var)
+        
+        # Replace bins for this variable
+        new_bins = new_bins[new_bins['var'] != var]
+        new_bins = pd.concat([new_bins, working_bins], ignore_index=True)
+        
+        # Update variable summary
+        total_row = working_bins[working_bins['bin'] == 'Total'].iloc[0]
+        mask = var_summary['var'] == var
+        if mask.any():
+            var_summary.loc[mask, 'iv'] = total_row['iv']
+            var_summary.loc[mask, 'ent'] = total_row['ent']
+            var_summary.loc[mask, 'trend'] = total_row['trend']
+            var_summary.loc[mask, 'monTrend'] = total_row.get('monTrend', 'Y')  # Should be monotonic now
+            var_summary.loc[mask, 'flipRatio'] = total_row.get('flipRatio', 0)
+            var_summary.loc[mask, 'numBins'] = total_row.get('numBins', len(working_bins) - 1)
+            var_summary.loc[mask, 'purNode'] = total_row['purNode']
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+def force_decr_trend(
+    bin_result: BinResult,
+    vars_to_process: Union[str, List[str]]
+) -> BinResult:
+    """
+    Force a decreasing monotonic trend in bad rates by combining adjacent bins.
+    
+    This function merges bins until bad rates are strictly decreasing from
+    low to high bin values. This is the opposite of force_incr_trend.
+    
+    Parameters:
+        bin_result (BinResult): Current binning results.
+        vars_to_process (Union[str, List[str]]): Variables to process.
+    
+    Returns:
+        BinResult: Updated binning results with monotonically decreasing bad rates.
+    """
+    # Convert single string to list
+    if isinstance(vars_to_process, str):
+        vars_to_process = [vars_to_process]
+    
+    new_bins = bin_result.bin.copy()
+    var_summary = bin_result.var_summary.copy()
+    
+    for var in vars_to_process:
+        # Get bins for this variable
+        var_bins = new_bins[(new_bins['var'] == var) & (new_bins['bin'] != 'Total')].copy()
+        
+        # Skip if not enough bins
+        if var_bins.empty or len(var_bins) < 2:
+            continue
+        
+        # Separate NA bin
+        na_mask = var_bins['bin'].str.contains('is.na', regex=False, na=False)
+        na_bin = var_bins[na_mask].copy() if na_mask.any() else pd.DataFrame()
+        working_bins = var_bins[~na_mask].copy()
+        
+        if working_bins.empty:
+            continue
+        
+        working_bins = working_bins.reset_index(drop=True)
+        
+        # Iteratively merge bins that violate decreasing trend
+        changed = True
+        while changed and len(working_bins) > 1:
+            changed = False
+            
+            # Calculate current bad rates
+            working_bins['bad_rate_calc'] = working_bins['bads'] / working_bins['count']
+            
+            # Find first violation (bad rate increases instead of decreasing)
+            for i in range(1, len(working_bins)):
+                if working_bins.iloc[i]['bad_rate_calc'] > working_bins.iloc[i-1]['bad_rate_calc']:
+                    # Merge bin i with bin i-1
+                    working_bins.iloc[i-1, working_bins.columns.get_loc('count')] += working_bins.iloc[i]['count']
+                    working_bins.iloc[i-1, working_bins.columns.get_loc('goods')] += working_bins.iloc[i]['goods']
+                    working_bins.iloc[i-1, working_bins.columns.get_loc('bads')] += working_bins.iloc[i]['bads']
+                    
+                    # Update the bin rule
+                    old_rule = working_bins.iloc[i-1]['bin']
+                    new_rule = working_bins.iloc[i]['bin']
+                    
+                    if '<=' in new_rule:
+                        new_upper = _parse_numeric_from_rule(new_rule)
+                        if new_upper:
+                            max_upper = max(new_upper)
+                            if '<=' in old_rule and '>' in old_rule:
+                                lower_vals = _parse_numeric_from_rule(old_rule.split('&')[0]) if '&' in old_rule else []
+                                if lower_vals:
+                                    working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} > '{min(lower_vals)}' & {var} <= '{max_upper}'"
+                                else:
+                                    working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} <= '{max_upper}'"
+                            elif '<=' in old_rule:
+                                working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} <= '{max_upper}'"
+                    elif '>' in new_rule and '<=' not in new_rule:
+                        if '>' in old_rule:
+                            old_lower = _parse_numeric_from_rule(old_rule.split('&')[0]) if '&' in old_rule else _parse_numeric_from_rule(old_rule)
+                            if old_lower:
+                                working_bins.iloc[i-1, working_bins.columns.get_loc('bin')] = f"{var} > '{min(old_lower)}'"
+                    
+                    # Remove merged bin
+                    working_bins = working_bins.drop(working_bins.index[i]).reset_index(drop=True)
+                    changed = True
+                    break
+        
+        # Add back NA bin
+        if not na_bin.empty:
+            working_bins = pd.concat([working_bins, na_bin], ignore_index=True)
+        
+        # Remove temporary column
+        if 'bad_rate_calc' in working_bins.columns:
+            working_bins = working_bins.drop('bad_rate_calc', axis=1)
+        
+        # Recalculate statistics
+        working_bins = update_bin_stats(working_bins)
+        working_bins = add_total_row(working_bins, var)
+        
+        # Replace bins for this variable
+        new_bins = new_bins[new_bins['var'] != var]
+        new_bins = pd.concat([new_bins, working_bins], ignore_index=True)
+        
+        # Update variable summary
+        total_row = working_bins[working_bins['bin'] == 'Total'].iloc[0]
+        mask = var_summary['var'] == var
+        if mask.any():
+            var_summary.loc[mask, 'iv'] = total_row['iv']
+            var_summary.loc[mask, 'ent'] = total_row['ent']
+            var_summary.loc[mask, 'trend'] = total_row['trend']
+            var_summary.loc[mask, 'monTrend'] = total_row.get('monTrend', 'Y')
+            var_summary.loc[mask, 'flipRatio'] = total_row.get('flipRatio', 0)
+            var_summary.loc[mask, 'numBins'] = total_row.get('numBins', len(working_bins) - 1)
+            var_summary.loc[mask, 'purNode'] = total_row['purNode']
+    
+    return BinResult(var_summary=var_summary, bin=new_bins)
+
+
+def create_binned_columns(
+    bin_result: BinResult,
+    df: pd.DataFrame,
+    x_vars: List[str],
+    prefix: str = "b_"
+) -> pd.DataFrame:
+    """
+    Create binned columns in the DataFrame based on binning rules.
+    
+    This function applies the binning rules to the data, creating new columns
+    with the bin labels. These binned columns can then be used for scorecard
+    scoring or joined with WOE values.
+    
+    Parameters:
+        bin_result (BinResult): The binning results with rules.
+        df (pd.DataFrame): The data to transform.
+        x_vars (List[str]): List of variables to create binned columns for.
+        prefix (str): Prefix for the binned column names (default "b_").
+    
+    Returns:
+        pd.DataFrame: DataFrame with original columns plus binned columns (b_*).
+    """
+    # Make a copy to avoid modifying original
+    result_df = df.copy()
+    
+    # Process each variable
+    for var in x_vars:
+        # Get bins for this variable (excluding Total row)
+        var_bins = bin_result.bin[(bin_result.bin['var'] == var) & 
+                                   (bin_result.bin['bin'] != 'Total')]
+        
+        # Skip if no bins
+        if var_bins.empty:
+            continue
+        
+        # Create new column name with prefix
+        new_col = prefix + var
+        
+        # Initialize column with None values
+        result_df[new_col] = None
+        
+        # Track NA rule for special handling
+        na_rule = None
+        
+        # Apply each bin rule
+        for _, row in var_bins.iterrows():
+            rule = row['bin']
+            
+            # Create bin value (the rule without variable name prefix)
+            bin_value = rule.replace(var, '').replace(' %in% c', '').strip()
+            
+            # Check for combined NA rule (e.g., "x <= 50 | is.na(x)")
+            if '| is.na' in rule:
+                na_rule = bin_value
+                main_rule = rule.split('|')[0].strip()
+            else:
+                main_rule = rule
+            
+            try:
+                is_na_bin = False
+                
+                # Parse and apply the rule
+                if 'is.na' in main_rule and '|' not in main_rule:
+                    # Standalone NA bin
+                    mask = result_df[var].isna()
+                    is_na_bin = True
+                    
+                elif '%in%' in main_rule:
+                    # Factor/categorical rule
+                    values = _parse_factor_values_from_rule(main_rule)
+                    mask = result_df[var].isin(values)
+                    
+                elif '<=' in main_rule and '>' in main_rule:
+                    # Range bin: x > lower & x <= upper
+                    nums = _parse_numeric_from_rule(main_rule)
+                    if len(nums) >= 2:
+                        lower, upper = min(nums), max(nums)
+                        mask = (result_df[var] > lower) & (result_df[var] <= upper)
+                    else:
+                        continue
+                        
+                elif '<=' in main_rule:
+                    # Upper bound only: x <= upper
+                    nums = _parse_numeric_from_rule(main_rule)
+                    if nums:
+                        upper = max(nums)
+                        mask = result_df[var] <= upper
+                    else:
+                        continue
+                        
+                elif '>' in main_rule:
+                    # Lower bound only: x > lower
+                    nums = _parse_numeric_from_rule(main_rule)
+                    if nums:
+                        lower = min(nums)
+                        mask = result_df[var] > lower
+                    else:
+                        continue
+                        
+                elif '==' in main_rule:
+                    # Exact match
+                    nums = _parse_numeric_from_rule(main_rule)
+                    if nums:
+                        result_df.loc[result_df[var] == nums[0], new_col] = bin_value
+                    continue
+                else:
+                    continue
+                
+                # Apply the mask - for NA bins, apply directly; for others, exclude NAs
+                if is_na_bin:
+                    result_df.loc[mask, new_col] = bin_value
+                else:
+                    result_df.loc[mask & result_df[var].notna(), new_col] = bin_value
+                
+            except Exception:
+                continue
+        
+        # Handle NA values
+        if na_rule is not None:
+            # NA is combined with another bin
+            result_df.loc[result_df[var].isna(), new_col] = na_rule
+        elif result_df[var].isna().any():
+            # Look for standalone NA bin
+            na_bins = var_bins[var_bins['bin'].str.match(r'^is\.na\(', na=False)]
+            if not na_bins.empty:
+                bin_value = na_bins.iloc[0]['bin'].replace(var, '').replace(' %in% c', '').strip()
+                result_df.loc[result_df[var].isna(), new_col] = bin_value
+        
+        # Handle any remaining unassigned rows (edge cases)
+        unassigned_mask = result_df[new_col].isna() | (result_df[new_col] == None)
+        if unassigned_mask.any():
+            # Assign to first bin as fallback
+            if na_rule is not None:
+                fallback_bin = na_rule
+            elif not var_bins.empty:
+                fallback_bin = var_bins.iloc[0]['bin'].replace(var, '').replace(' %in% c', '').strip()
+            else:
+                fallback_bin = "Unmatched"
+            result_df.loc[unassigned_mask, new_col] = fallback_bin
+    
+    return result_df
+
+
+def add_woe_columns(
+    df: pd.DataFrame,
+    bins_df: pd.DataFrame,
+    x_vars: List[str],
+    prefix: str = "b_",
+    woe_prefix: str = "WOE_"
+) -> pd.DataFrame:
+    """
+    Add WOE columns to the DataFrame by joining with binning rules.
+    
+    This function maps each binned value to its corresponding WOE value,
+    creating WOE columns that can be used directly in logistic regression.
+    
+    Missing/unmatched bin values are assigned WOE=0 (neutral - no information).
+    
+    Parameters:
+        df (pd.DataFrame): DataFrame with binned columns (from create_binned_columns).
+        bins_df (pd.DataFrame): Binning rules DataFrame with WOE values.
+        x_vars (List[str]): List of variables to add WOE columns for.
+        prefix (str): Prefix used for binned columns (default "b_").
+        woe_prefix (str): Prefix for WOE columns (default "WOE_").
+    
+    Returns:
+        pd.DataFrame: DataFrame with WOE columns added.
+    """
+    result_df = df.copy()
+    
+    for var in x_vars:
+        # Get bins for this variable (excluding Total)
+        var_bins = bins_df[(bins_df['var'] == var) & (bins_df['bin'] != 'Total')].copy()
+        
+        # Skip if no bins
+        if var_bins.empty:
+            continue
+        
+        # Ensure WOE column exists
+        if 'woe' not in var_bins.columns:
+            var_bins['woe'] = calculate_woe(var_bins['goods'].values, var_bins['bads'].values)
+        
+        # Create bin value column (for mapping)
+        var_bins['binValue'] = var_bins['bin'].apply(
+            lambda x: x.replace(var, '').replace(' %in% c', '').strip()
+        )
+        
+        # Define column names
+        bin_col = prefix + var
+        woe_col = woe_prefix + var
+        
+        # Map binned values to WOE values
+        if bin_col in result_df.columns:
+            woe_map = dict(zip(var_bins['binValue'], var_bins['woe']))
+            result_df[woe_col] = result_df[bin_col].map(woe_map)
+            
+            # Check for any unmapped bin values - indicates a bug
+            missing_woe_count = result_df[woe_col].isna().sum()
+            if missing_woe_count > 0:
+                unmapped_bins = result_df.loc[result_df[woe_col].isna(), bin_col].unique()
+                print(f"[ERROR] {var}: {missing_woe_count} rows have unmapped bin values!")
+                print(f"        Unmapped bins: {list(unmapped_bins)}")
+                print(f"        Available bins in woe_map: {list(woe_map.keys())}")
+                
+                # Try to fix unmapped bins
+                for unmapped_bin in unmapped_bins:
+                    if unmapped_bin is None or pd.isna(unmapped_bin):
+                        # Find NA bin WOE
+                        na_woe_bins = var_bins[var_bins['bin'].str.contains('is.na', na=False)]
+                        if not na_woe_bins.empty:
+                            na_woe = na_woe_bins.iloc[0]['woe']
+                            result_df.loc[result_df[bin_col].isna(), woe_col] = na_woe
+                            print(f"        -> Assigned NA bin WOE: {na_woe}")
+                    else:
+                        # Try exact match in original bin rules
+                        for _, bin_row in var_bins.iterrows():
+                            if unmapped_bin in bin_row['bin'] or bin_row['binValue'] == unmapped_bin:
+                                result_df.loc[result_df[bin_col] == unmapped_bin, woe_col] = bin_row['woe']
+                                print(f"        -> Matched '{unmapped_bin}' to WOE: {bin_row['woe']}")
+                                break
+    
+    return result_df
