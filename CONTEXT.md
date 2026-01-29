@@ -74,10 +74,10 @@ Build Python scripts that run inside **KNIME 5.9 Python Script nodes** for credi
   - Dynamic starting granularity based on variable characteristics
   - Merges pure bins to closest adjacent by WOE value
   - Best for fraud detection with non-monotonic patterns
-- **Documentation**: See `WOE node files/WOE_Editor_Enhancements.md`
+- **Documentation**: See `woe_editor/WOE_Editor_Enhancements.md`
 
 ### `woe_config_generator.py` (Utility)
-- **Location**: `WOE node files/woe_config_generator.py`
+- **Location**: `woe_editor/woe_config_generator.py`
 - **Status**: Complete (v1.1)
 - **Purpose**: Generates KNIME table with all flow variables for WOE Editor Advanced
 - **Presets**:
@@ -320,7 +320,7 @@ def is_missing(value):
 - [ ] Test logistic_regression_knime.py in KNIME
 - [ ] Test model_analyzer_knime.py in KNIME
 
-### WOE Editor Enhancements (see `WOE node files/WOE_Editor_Enhancements.md`)
+### WOE Editor Enhancements (see `woe_editor/WOE_Editor_Enhancements.md`)
 - [ ] Smart SingleBinProtection - merge bins for max IV instead of skipping
 - [ ] Isotonic regression smoothing for WOE values
 - [ ] Population Stability Index (PSI) calculation

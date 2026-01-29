@@ -67,8 +67,8 @@ This project contains Python scripts designed to run inside KNIME 5.9 Python Scr
 - Dynamic starting granularity based on variable characteristics
 - Merges pure bins to closest adjacent by WOE value
 
-**Documentation**: See `WOE node files/WOE_Editor_Enhancements.md`
-**Config Generator**: Use `WOE node files/woe_config_generator.py` to create flow variable tables
+**Documentation**: See `woe_editor/WOE_Editor_Enhancements.md`
+**Config Generator**: Use `woe_editor/woe_config_generator.py` to create flow variable tables
 
 **Key Functions Implemented**:
 - `get_bins()` - Optimal binning using decision trees (like logiBin::getBins)

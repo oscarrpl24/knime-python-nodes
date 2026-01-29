@@ -4,13 +4,13 @@ Python scripts for KNIME 5.9 Python Script nodes, providing a complete credit ri
 
 ## Features
 
-- **Reject Inference** (`reject_inference.py`): Infer outcomes for rejected loan applications
-- **WOE Binning** (`woe_editor_advanced.py`): Weight of Evidence transformation with DecisionTree, ChiMerge, and IVOptimal algorithms
-- **Variable Selection** (`variable_selection_knime.py`): Feature selection with IV, Gini, Chi-Square, VIF filtering, and EBM interaction discovery
-- **Logistic Regression** (`logistic_regression_knime.py`): Stepwise selection (Forward, Backward, Both)
-- **Scorecard Generation** (`scorecard_knime.py`): Convert logistic regression + WOE to point-based scorecards
-- **Scorecard Application** (`scorecard_apply_knime.py`): Apply scorecard to new data
-- **Model Analysis** (`model_analyzer_knime.py`): ROC curves, K-S charts, Lorenz curves, Gains tables
+- **Reject Inference**: Infer outcomes for rejected loan applications
+- **WOE Binning**: Weight of Evidence transformation with DecisionTree, ChiMerge, and IVOptimal algorithms
+- **Variable Selection**: Feature selection with IV, Gini, Chi-Square, VIF filtering, and EBM interaction discovery
+- **Logistic Regression**: Stepwise selection (Forward, Backward, Both)
+- **Scorecard Generation**: Convert logistic regression + WOE to point-based scorecards
+- **Scorecard Application**: Apply scorecard to new data
+- **Model Analysis**: ROC curves, K-S charts, Lorenz curves, Gains tables
 
 ## Requirements
 
@@ -27,49 +27,65 @@ All dependencies are auto-installed by scripts if missing.
 3. Set flow variables for headless mode (optional)
 4. Execute the node
 
-## Scripts
+## Project Structure
 
-### Core Nodes
+Each KNIME node has its own folder containing the Python script and related files (R references, documentation, sample data):
 
-| Script | Purpose | Interactive UI |
-|--------|---------|----------------|
-| `reject_inference.py` | Reject inference for credit scoring | No |
-| `woe_editor_advanced.py` | WOE binning (recommended) | Yes |
-| `woe_editor_knime.py` | WOE binning (base version) | Yes |
-| `woe_editor_knime_parallel.py` | WOE binning with parallel processing | Yes |
-| `attribute_editor_knime.py` | Variable metadata configuration | Yes |
-| `variable_selection_knime.py` | Feature selection with metrics | Yes |
-| `logistic_regression_knime.py` | Logistic regression modeling | Yes |
-| `scorecard_knime.py` | Scorecard generation | No |
-| `scorecard_apply_knime.py` | Apply scorecard to data | No |
-| `model_analyzer_knime.py` | Model diagnostics and charts | Yes |
-| `is_bad_flag_knime.py` | Binary target variable encoding | No |
-| `column_separator_knime.py` | Column type separation | No |
-| `ccr_score_filter_knime.py` | CCR score filtering | No |
+```
+├── woe_editor/              # WOE binning (3 versions + docs + R reference)
+├── variable_selection/      # Feature selection + R reference
+├── logistic_regression/     # Logistic regression modeling
+├── scorecard/               # Scorecard generation + guides
+├── scorecard_apply/         # Apply scorecard + R reference
+├── model_analyzer/          # Model diagnostics
+├── attribute_editor/        # Variable metadata configuration
+├── reject_inference/        # Reject inference
+├── is_bad_flag/             # Binary target encoding
+├── column_separator/        # Column type separation
+├── ccr_score_filter/        # CCR score filtering
+├── clean_b_score/           # Score cleaning utility
+├── archive/                 # Obsolete/legacy files
+├── .cursorrules             # AI assistant configuration
+├── CONTEXT.md               # Quick start for AI agents
+├── COMPREHENSIVE_DEVELOPMENT_LOG.md
+└── README.md
+```
 
-### Utility Scripts
+## Core Nodes
 
-| Script | Purpose |
-|--------|---------|
-| `clean_b_score.py` | Score cleaning utility |
-| `WOE node files/woe_config_generator.py` | Generate flow variable tables for WOE Editor |
+| Folder | Script | Purpose | Interactive UI |
+|--------|--------|---------|----------------|
+| `woe_editor/` | `woe_editor_advanced.py` | WOE binning (recommended) | Yes |
+| `woe_editor/` | `woe_editor_knime.py` | WOE binning (base version) | Yes |
+| `woe_editor/` | `woe_editor_knime_parallel.py` | WOE binning with parallel processing | Yes |
+| `variable_selection/` | `variable_selection_knime.py` | Feature selection with metrics | Yes |
+| `logistic_regression/` | `logistic_regression_knime.py` | Logistic regression modeling | Yes |
+| `scorecard/` | `scorecard_knime.py` | Scorecard generation | No |
+| `scorecard_apply/` | `scorecard_apply_knime.py` | Apply scorecard to data | No |
+| `model_analyzer/` | `model_analyzer_knime.py` | Model diagnostics and charts | Yes |
+| `attribute_editor/` | `attribute_editor_knime.py` | Variable metadata configuration | Yes |
+| `reject_inference/` | `reject_inference.py` | Reject inference for credit scoring | No |
+| `is_bad_flag/` | `is_bad_flag_knime.py` | Binary target variable encoding | No |
+| `column_separator/` | `column_separator_knime.py` | Column type separation | No |
+| `ccr_score_filter/` | `ccr_score_filter_knime.py` | CCR score filtering | No |
+| `clean_b_score/` | `clean_b_score.py` | Score cleaning utility | No |
 
 ## WOE Editor Algorithms
 
-The advanced WOE editor (`woe_editor_advanced.py`) supports three binning algorithms:
+The advanced WOE editor (`woe_editor/woe_editor_advanced.py`) supports three binning algorithms:
 
 1. **DecisionTree** (default): R-compatible, matches logiBin::getBins
 2. **ChiMerge**: Chi-square based bin merging
 3. **IVOptimal**: Maximizes Information Value, preserves non-monotonic patterns (ideal for fraud models)
 
-See [WOE Editor Enhancements](WOE%20node%20files/WOE_Editor_Enhancements.md) for detailed documentation.
+See [WOE Editor Enhancements](woe_editor/WOE_Editor_Enhancements.md) for detailed documentation.
 
 ## Documentation
 
 - [CONTEXT.md](CONTEXT.md) - Quick start for AI agents
-- [WOE Editor Enhancements](WOE%20node%20files/WOE_Editor_Enhancements.md) - Advanced WOE features
-- [Scorecard Node Updates](SCORECARD_NODE_UPDATES.md) - Scorecard node changelog
-- [WOE Output Ports Guide](WOE_OUTPUT_PORTS_GUIDE.md) - WOE output configuration
+- [WOE Editor Enhancements](woe_editor/WOE_Editor_Enhancements.md) - Advanced WOE features
+- [Scorecard Node Updates](scorecard/SCORECARD_NODE_UPDATES.md) - Scorecard node changelog
+- [WOE Output Ports Guide](woe_editor/WOE_OUTPUT_PORTS_GUIDE.md) - WOE output configuration
 
 ## Development
 

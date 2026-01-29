@@ -58,11 +58,8 @@ desktop.ini
 *.temp
 *.bak
 
-# Documentation folder (Cursor conversation exports)
-Documentation/
-
-# Attribute Editor test data
-Attribute Editor/
+# Archive folder (obsolete files and Cursor exports)
+archive/
 
 # Terminals folder (Cursor IDE)
 terminals/
