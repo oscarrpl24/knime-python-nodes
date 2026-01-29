@@ -3414,3 +3414,387 @@ def run_variable_selection(
     sys.stdout.flush()
     
     return app.results
+
+
+# =============================================================================
+# SECTION 17: HEADLESS MODE PROCESSING
+# =============================================================================
+# Headless mode runs variable selection without the interactive UI.
+# All parameters are provided via KNIME flow variables.
+
+def run_headless_selection(
+    df: pd.DataFrame,
+    dv: str,
+    measures_to_calc: List[str],
+    num_of_variables: int,
+    criteria: str,
+    degree: int,
+    max_interactions: int = 20,
+    top_interactions: int = 10,
+    auto_add_missed: bool = True,
+    max_missed_to_add: int = 0,
+    vif_threshold: float = 0.0,
+    min_prop: float = 0.01,
+    use_xgboost: bool = True,
+    xgb_n_estimators: int = 3000,
+    xgb_max_depth: int = 8,
+    xgb_learning_rate: float = 0.01,
+    xgb_colsample: float = 0.5,
+    xgb_subsample: float = 0.8,
+    xgb_reg_alpha: float = 0.5,
+    xgb_reg_lambda: float = 2.0,
+    xgb_importance_threshold: float = 0.05,
+    xgb_top_n: int = 25,
+    xgb_num_gpus: int = 2
+) -> Dict[str, Any]:
+    """
+    Run variable selection in headless mode (no UI).
+    
+    PURPOSE:
+    Performs the complete variable selection workflow programmatically,
+    using parameters provided via flow variables. This enables automated
+    pipelines without user interaction.
+    
+    PARAMETERS:
+    - df (pd.DataFrame): Input dataset with WOE columns
+    - dv (str): Dependent variable name
+    - measures_to_calc (List[str]): List of measures to calculate
+    - num_of_variables (int): Top N variables per measure
+    - criteria (str): 'Union' or 'Intersection'
+    - degree (int): Degree for Intersection criteria
+    - max_interactions (int): Max EBM interactions to detect
+    - top_interactions (int): Top interactions to include in output
+    - auto_add_missed (bool): Whether to auto-add ML-missed variables
+    - max_missed_to_add (int): Max missed vars to add (0 = ALL)
+    - vif_threshold (float): VIF threshold for removal (0 = no filtering)
+    - min_prop (float): Minimum proportion per bin
+    - use_xgboost (bool): Whether to use XGBoost
+    - xgb_* parameters: XGBoost configuration options
+    
+    RETURNS:
+    Dict containing: measures, selected_data, ebm_report, correlation_matrix, vif_report
+    """
+    
+    print(f"Running headless variable selection with DV: {dv}")
+    print(f"Criteria: {criteria}, NumVars: {num_of_variables}, Degree: {degree}")
+    max_missed_str = "ALL" if max_missed_to_add == 0 else str(max_missed_to_add)
+    vif_str = "disabled" if vif_threshold == 0 else f">= {vif_threshold}"
+    print(f"Auto-add missed: {auto_add_missed}, Max missed to add: {max_missed_str}")
+    print(f"VIF filtering: {vif_str}")
+    
+    # Get all independent variables (exclude DV)
+    iv_list = [col for col in df.columns if col != dv]
+    print(f"Found {len(iv_list)} potential independent variables")
+    
+    # Calculate bins internally using get_bins
+    print("Calculating bins for all variables...")
+    bin_result = get_bins(df, dv, iv_list, min_prop=min_prop)
+    bins_df = bin_result.bin
+    var_summary = bin_result.var_summary
+    print(f"Generated bins for {len(var_summary)} variables")
+    
+    # Calculate measures
+    if len(measures_to_calc) > 0:
+        measures = calculate_all_measures(bins_df, var_summary, measures_to_calc)
+        print(f"Calculated measures for {len(measures)} variables")
+        
+        # Add ranks to measures
+        measures = add_ranks_to_measures(measures)
+        
+        # Filter variables based on criteria
+        measures = filter_variables(measures, criteria, num_of_variables, degree)
+        selected_vars = measures[measures['Selected'] == True]['Variable'].tolist()
+    else:
+        # No measures specified - select all variables
+        selected_vars = var_summary['var'].tolist()
+        measures = pd.DataFrame({'Variable': selected_vars, 'Selected': True})
+    
+    print(f"Selected {len(selected_vars)} variables by traditional method")
+    
+    # Get WOE columns for ML training
+    woe_cols = [col for col in df.columns if col.startswith('WOE_')]
+    
+    # Initialize ML results
+    ebm_report = None
+    xgb_report = None
+    interaction_cols = []
+    missed_to_add = []
+    xgb_missed = []
+    
+    # Check what models we can run
+    can_run_ebm = woe_cols and dv in df.columns and EBM_AVAILABLE
+    can_run_xgb = use_xgboost and woe_cols and dv in df.columns and XGBOOST_AVAILABLE
+    
+    # Run EBM and XGBoost in parallel for faster discovery
+    if can_run_ebm or can_run_xgb:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+        
+        futures = {}
+        start_time = time.time()
+        
+        print(f"\n{'='*50}")
+        print(f"PARALLEL ML DISCOVERY on {len(woe_cols)} WOE columns")
+        print(f"  EBM: {'enabled' if can_run_ebm else 'disabled'}")
+        print(f"  XGBoost: {'enabled (GPU)' if can_run_xgb and XGBOOST_GPU_AVAILABLE else 'enabled (CPU)' if can_run_xgb else 'disabled'}")
+        print(f"{'='*50}")
+        
+        # Use ThreadPoolExecutor to run EBM and XGBoost in parallel
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Submit EBM training
+            if can_run_ebm:
+                futures['EBM'] = executor.submit(
+                    train_ebm_for_discovery,
+                    df, dv, woe_cols, max_interactions
+                )
+            
+            # Submit XGBoost training
+            if can_run_xgb:
+                futures['XGBoost'] = executor.submit(
+                    train_xgboost_for_discovery,
+                    df, dv, woe_cols,
+                    XGBOOST_GPU_AVAILABLE,
+                    xgb_n_estimators,
+                    xgb_max_depth,
+                    xgb_learning_rate,
+                    True,  # discover_interactions
+                    max_interactions,
+                    xgb_colsample,
+                    xgb_subsample,
+                    xgb_reg_alpha,
+                    xgb_reg_lambda,
+                    xgb_num_gpus
+                )
+            
+            # Collect results as they complete
+            for future in as_completed(futures.values()):
+                model_name = [k for k, v in futures.items() if v == future][0]
+                try:
+                    result = future.result()
+                    if model_name == 'EBM':
+                        ebm_report = result
+                        print(f"  [DONE] EBM completed")
+                    else:
+                        xgb_report = result
+                        gpu_str = "(GPU)" if xgb_report and xgb_report.gpu_used else "(CPU)"
+                        print(f"  [DONE] XGBoost completed {gpu_str}")
+                except Exception as e:
+                    print(f"  [ERROR] {model_name} failed: {str(e)}")
+        
+        elapsed = time.time() - start_time
+        print(f"Parallel training completed in {elapsed:.2f} seconds")
+        print(f"{'='*50}\n")
+    else:
+        if not EBM_AVAILABLE:
+            print("EBM not available")
+        if not XGBOOST_AVAILABLE:
+            print("XGBoost not available")
+    
+    # Process EBM results
+    if ebm_report is not None:
+        missed = compare_selections(selected_vars, ebm_report.feature_importances, top_n=50)
+        ebm_report.missed_by_traditional = missed
+        print(f"EBM found {len(ebm_report.interactions)} interactions")
+        print(f"Variables missed by traditional selection (EBM): {len(missed)}")
+        
+        # Auto-add missed variables from EBM
+        if auto_add_missed and missed:
+            if max_missed_to_add == 0:
+                missed_to_add = missed
+            else:
+                missed_to_add = missed[:max_missed_to_add]
+            print(f"Auto-adding {len(missed_to_add)} EBM-missed variables")
+        
+        # Add EBM importance to measures
+        measures = add_ebm_importance_to_measures(measures, ebm_report.feature_importances)
+    
+    # Process XGBoost results
+    if xgb_report is not None:
+        xgb_missed = compare_xgb_selections(
+            selected_vars,
+            xgb_report.feature_importances,
+            top_n=xgb_top_n,
+            min_importance_threshold=xgb_importance_threshold
+        )
+        xgb_report.missed_by_traditional = xgb_missed
+        print(f"XGBoost found {len(xgb_report.interactions)} potential interactions")
+        print(f"Variables missed by traditional selection (XGBoost): {len(xgb_missed)}")
+        
+        # Auto-add XGBoost missed variables (not already added)
+        if auto_add_missed and xgb_missed:
+            xgb_new_missed = [v for v in xgb_missed if v not in missed_to_add]
+            if max_missed_to_add == 0:
+                missed_to_add.extend(xgb_new_missed)
+            else:
+                remaining = max(0, max_missed_to_add - len(missed_to_add))
+                missed_to_add.extend(xgb_new_missed[:remaining])
+            if xgb_new_missed:
+                print(f"Auto-adding {len(xgb_new_missed)} additional XGBoost-missed variables")
+        
+        # Add XGBoost importance to measures
+        if not xgb_report.feature_importances.empty:
+            xgb_imp = xgb_report.feature_importances[['Variable', 'XGB_Importance', 'XGB_Gain', 'XGB_Cover']].copy()
+            measures = measures.merge(xgb_imp, on='Variable', how='left')
+    
+    # Prepare output DataFrame
+    output_cols = [dv]  # Start with dependent variable
+    
+    # Add selected WOE variables
+    added_selected = 0
+    for var in selected_vars:
+        woe_col = f"WOE_{var}" if not var.startswith('WOE_') else var
+        if woe_col in df.columns:
+            output_cols.append(woe_col)
+            added_selected += 1
+        elif var in df.columns:
+            output_cols.append(var)
+            added_selected += 1
+    print(f"  Added {added_selected}/{len(selected_vars)} selected variables to output")
+    
+    # Add EBM-missed variables
+    added_missed = 0
+    for var in missed_to_add:
+        woe_col = var if var.startswith('WOE_') else f"WOE_{var}"
+        if woe_col in df.columns and woe_col not in output_cols:
+            output_cols.append(woe_col)
+            added_missed += 1
+        elif var in df.columns and var not in output_cols:
+            output_cols.append(var)
+            added_missed += 1
+    print(f"  Added {added_missed}/{len(missed_to_add)} EBM-missed variables to output")
+    print(f"  Total columns before VIF: {len(output_cols)} (1 DV + {added_selected} selected + {added_missed} EBM-missed)")
+    
+    output_df = df[output_cols].copy()
+    
+    # Add interaction columns from EBM
+    if ebm_report is not None and not ebm_report.interactions.empty:
+        output_df, ebm_int_cols = create_interaction_columns(
+            output_df,
+            ebm_report.interactions,
+            top_n=top_interactions
+        )
+        interaction_cols.extend(ebm_int_cols)
+        print(f"Added {len(ebm_int_cols)} EBM interaction columns")
+    
+    # Add interaction columns from XGBoost
+    if xgb_report is not None and not xgb_report.interactions.empty:
+        output_df, xgb_int_cols = create_interaction_columns(
+            output_df,
+            xgb_report.interactions,
+            top_n=top_interactions
+        )
+        # Only add unique interaction columns
+        new_xgb_cols = [c for c in xgb_int_cols if c not in interaction_cols]
+        interaction_cols.extend(new_xgb_cols)
+        if new_xgb_cols:
+            print(f"Added {len(new_xgb_cols)} XGBoost interaction columns")
+    
+    # Prepare ML Discovery report DataFrame (EBM + XGBoost)
+    ml_report_df = pd.DataFrame()
+    
+    # Add EBM interactions
+    if ebm_report is not None:
+        ebm_interactions = ebm_report.interactions.copy()
+        if not ebm_interactions.empty:
+            ebm_interactions['Source'] = 'EBM'
+            ebm_interactions['Status'] = 'Detected Interaction'
+            ebm_interactions['Included'] = True
+            ml_report_df = pd.concat([ml_report_df, ebm_interactions], ignore_index=True)
+        
+        # Add EBM missed variables
+        if ebm_report.missed_by_traditional:
+            missed_df = pd.DataFrame({
+                'Variable_1': ebm_report.missed_by_traditional,
+                'Variable_2': ['(single variable)'] * len(ebm_report.missed_by_traditional),
+                'Interaction_Name': ebm_report.missed_by_traditional,
+                'Magnitude': [None] * len(ebm_report.missed_by_traditional),
+                'Source': ['EBM'] * len(ebm_report.missed_by_traditional),
+                'Status': ['Missed by Traditional'] * len(ebm_report.missed_by_traditional),
+                'Included': [var in missed_to_add for var in ebm_report.missed_by_traditional]
+            })
+            ml_report_df = pd.concat([ml_report_df, missed_df], ignore_index=True)
+    
+    # Add XGBoost interactions
+    if xgb_report is not None:
+        xgb_interactions = xgb_report.interactions.copy()
+        if not xgb_interactions.empty:
+            xgb_interactions['Status'] = 'Detected Interaction'
+            xgb_interactions['Included'] = True
+            ml_report_df = pd.concat([ml_report_df, xgb_interactions], ignore_index=True)
+        
+        # Add XGBoost missed variables
+        if xgb_report.missed_by_traditional:
+            xgb_missed_df = pd.DataFrame({
+                'Variable_1': xgb_report.missed_by_traditional,
+                'Variable_2': ['(single variable)'] * len(xgb_report.missed_by_traditional),
+                'Interaction_Name': xgb_report.missed_by_traditional,
+                'Magnitude': [None] * len(xgb_report.missed_by_traditional),
+                'Source': ['XGBoost'] * len(xgb_report.missed_by_traditional),
+                'Status': ['Missed by Traditional'] * len(xgb_report.missed_by_traditional),
+                'Included': [var in missed_to_add for var in xgb_report.missed_by_traditional]
+            })
+            ml_report_df = pd.concat([ml_report_df, xgb_missed_df], ignore_index=True)
+    
+    # Use combined report (backward compatible variable name)
+    ebm_report_df = ml_report_df
+    
+    # Calculate correlation matrix (before VIF removal)
+    numeric_cols = [c for c in output_df.columns if c != dv and pd.api.types.is_numeric_dtype(output_df[c])]
+    corr_matrix = calculate_correlation_matrix(output_df, numeric_cols)
+    
+    # VIF filtering (only if threshold > 0)
+    removed_cols = []
+    removed_vif_info = []
+    
+    if vif_threshold > 0:
+        print(f"Checking for multicollinearity (VIF >= {vif_threshold})...")
+        remaining_cols, vif_report, removed_cols, removed_vif_info = remove_high_vif_iteratively(
+            output_df, numeric_cols, vif_threshold=vif_threshold
+        )
+        
+        if removed_cols:
+            print(f"Removed {len(removed_cols)} variables with VIF >= {vif_threshold}: {removed_cols}")
+            final_cols = [dv] + remaining_cols
+            output_df = output_df[final_cols].copy()
+            print(f"  Final columns after VIF: {len(output_df.columns)} (1 DV + {len(remaining_cols)} features)")
+            
+            # Add removed columns info to VIF report
+            vif_report['Removed'] = False
+            vif_report['Status'] = 'OK'
+            
+            removed_vif_df = pd.DataFrame(removed_vif_info)
+            removed_vif_df['Status'] = f'REMOVED (VIF>={vif_threshold})'
+            removed_vif_df['Removed'] = True
+            
+            vif_report = pd.concat([removed_vif_df, vif_report], ignore_index=True)
+        else:
+            print("No variables with VIF >= threshold found")
+            if not vif_report.empty:
+                vif_report['Removed'] = False
+                vif_report['Status'] = 'OK'
+    else:
+        print("VIF filtering disabled (threshold = 0)")
+        # Calculate VIF for reporting only
+        vif_report = calculate_vif(output_df, numeric_cols)
+        if not vif_report.empty:
+            vif_report['Removed'] = False
+            vif_report['Status'] = 'OK'
+    
+    # Ensure VIF column is numeric
+    if not vif_report.empty and 'VIF' in vif_report.columns:
+        vif_report['VIF'] = pd.to_numeric(vif_report['VIF'], errors='coerce')
+    
+    moderate_vif = len(vif_report[
+        (vif_report['Removed'] == False) &
+        (vif_report['VIF'] > 5)
+    ]) if not vif_report.empty else 0
+    print(f"VIF summary: {len(removed_cols)} removed, {moderate_vif} moderate (5-11)")
+    
+    return {
+        'measures': measures,
+        'selected_data': output_df,
+        'ebm_report': ebm_report_df,
+        'correlation_matrix': corr_matrix,
+        'vif_report': vif_report,
+        'removed_for_vif': removed_cols
+    }
