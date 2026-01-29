@@ -3798,3 +3798,455 @@ def run_headless_selection(
         'vif_report': vif_report,
         'removed_for_vif': removed_cols
     }
+
+
+# =============================================================================
+# SECTION 18: READ INPUT DATA
+# =============================================================================
+# This section reads the input data from KNIME and prints initial diagnostics.
+
+# Print startup banner
+print("Variable Selection Node - Starting...")
+print("=" * 70)
+
+# Read input table from KNIME
+# input_tables[0] is the first (and only) input port
+# to_pandas() converts KNIME's table format to a pandas DataFrame
+df = knio.input_tables[0].to_pandas()
+
+# Print basic data info
+print(f"Input data: {len(df)} rows, {len(df.columns)} columns")
+print("=" * 70)
+
+
+# =============================================================================
+# SECTION 19: CHECK FOR FLOW VARIABLES (HEADLESS MODE DETECTION)
+# =============================================================================
+# This section reads flow variables from KNIME and determines whether to run
+# in headless mode (all required variables provided) or interactive mode.
+
+# Initialize variables with default values
+contains_all_vars = False  # Flag: True if all required flow vars are present
+dv = None                  # Dependent Variable name
+measures_of_power = None   # Comma-separated measures string
+num_of_variables = None    # Number of top variables per measure
+criteria = None            # 'Union' or 'Intersection'
+degree = None              # Degree for Intersection criteria
+max_interactions = 20      # Max EBM interactions to detect
+top_interactions = 10      # Top interactions to include
+auto_add_missed = True     # Auto-add ML-missed variables
+max_missed_to_add = 0      # Max missed to add (0 = ALL)
+
+# Try to read each flow variable with error handling
+# Using try/except ensures the script doesn't crash if a variable doesn't exist
+
+try:
+    # DependentVariable: Name of the binary target column (e.g., 'IsFPD')
+    dv = knio.flow_variables.get("DependentVariable", None)
+except:
+    pass  # Variable doesn't exist, keep default
+
+try:
+    # MeasuresOfPredictivePower: Comma-separated list of measures
+    # e.g., "EntropyExplained, InformationValue, Gini"
+    measures_of_power = knio.flow_variables.get("MeasuresOfPredictivePower", None)
+except:
+    pass
+
+try:
+    # NumberOfVariables: Top N variables to consider for each measure
+    num_of_variables = knio.flow_variables.get("NumberOfVariables", None)
+except:
+    pass
+
+try:
+    # Criteria: Selection strategy ('Union' or 'Intersection')
+    criteria = knio.flow_variables.get("Criteria", None)
+except:
+    pass
+
+try:
+    # Degree: For Intersection, minimum number of measures a variable must rank in
+    degree = knio.flow_variables.get("Degree", None)
+except:
+    pass
+
+try:
+    # MaxInteractions: Maximum EBM interactions to detect
+    max_interactions = knio.flow_variables.get("MaxInteractions", 20)
+except:
+    pass
+
+try:
+    # TopInteractions: How many top interactions to include in output
+    top_interactions = knio.flow_variables.get("TopInteractions", 10)
+except:
+    pass
+
+try:
+    # AutoAddMissed: Whether to automatically add ML-discovered missed variables
+    auto_add_missed = knio.flow_variables.get("AutoAddMissed", True)
+except:
+    pass
+
+try:
+    # MaxMissedToAdd: Maximum missed variables to add (0 = add ALL)
+    max_missed_to_add = knio.flow_variables.get("MaxMissedToAdd", 0)
+except:
+    pass
+
+try:
+    # VIFThreshold: Variables with VIF >= this are removed (0 = no filtering)
+    vif_threshold = knio.flow_variables.get("VIFThreshold", 0.0)
+except:
+    vif_threshold = 0.0  # No VIF filtering by default
+
+# =============================================================================
+# XGBOOST PARAMETERS - Optimized for robust feature selection
+# =============================================================================
+# These settings take ~3-5 minutes but produce reliable feature rankings
+
+use_xgboost = True         # Use XGBoost for feature discovery
+xgb_n_estimators = 3000    # More rounds = more stable importance
+xgb_max_depth = 8          # Deeper trees for better discrimination
+xgb_learning_rate = 0.01   # Lower rate + more trees = reliable rankings
+xgb_colsample = 0.5        # 50% column sampling (stronger regularization)
+xgb_subsample = 0.8        # 80% row sampling per tree
+xgb_reg_alpha = 0.5        # L1 regularization (zeros out weak features)
+xgb_reg_lambda = 2.0       # L2 regularization (shrinks marginal importance)
+xgb_importance_threshold = 0.05  # Only features >= 5% of max importance
+xgb_top_n = 25             # Only consider top 25 features from XGBoost
+
+# Read XGBoost flow variables
+try:
+    use_xgboost = knio.flow_variables.get("UseXGBoost", True)
+except:
+    pass
+
+try:
+    xgb_n_estimators = knio.flow_variables.get("XGBEstimators", 3000)
+except:
+    pass
+
+try:
+    xgb_max_depth = knio.flow_variables.get("XGBMaxDepth", 8)
+except:
+    pass
+
+try:
+    xgb_learning_rate = knio.flow_variables.get("XGBLearningRate", 0.01)
+except:
+    pass
+
+try:
+    xgb_colsample = knio.flow_variables.get("XGBColsampleByTree", 0.5)
+except:
+    pass
+
+try:
+    xgb_subsample = knio.flow_variables.get("XGBSubsample", 0.8)
+except:
+    pass
+
+try:
+    xgb_reg_alpha = knio.flow_variables.get("XGBRegAlpha", 0.5)
+except:
+    pass
+
+try:
+    xgb_reg_lambda = knio.flow_variables.get("XGBRegLambda", 2.0)
+except:
+    pass
+
+try:
+    xgb_importance_threshold = knio.flow_variables.get("XGBImportanceThreshold", 0.05)
+except:
+    pass
+
+try:
+    xgb_top_n = knio.flow_variables.get("XGBTopN", 25)
+except:
+    pass
+
+# Number of GPUs for parallel XGBoost training
+xgb_num_gpus = 2
+
+try:
+    xgb_num_gpus = knio.flow_variables.get("XGBNumGPUs", 2)
+except:
+    pass
+
+# Debug: Print all detected flow variables
+print("=" * 70)
+print("FLOW VARIABLES DETECTED:")
+print(f"  DependentVariable: {dv} (type: {type(dv).__name__})")
+print(f"  MeasuresOfPredictivePower: {measures_of_power} (type: {type(measures_of_power).__name__})")
+print(f"  NumberOfVariables: {num_of_variables} (type: {type(num_of_variables).__name__})")
+print(f"  Criteria: {criteria} (type: {type(criteria).__name__})")
+print(f"  Degree: {degree} (type: {type(degree).__name__})")
+print(f"  UseXGBoost: {use_xgboost} (GPU available: {XGBOOST_GPU_AVAILABLE}, using {xgb_num_gpus} GPUs)")
+
+if use_xgboost:
+    print(f"    XGBEstimators: {xgb_n_estimators}, MaxDepth: {xgb_max_depth}, LR: {xgb_learning_rate}")
+    print(f"    ColSample: {xgb_colsample}, SubSample: {xgb_subsample}")
+    print(f"    L1 (reg_alpha): {xgb_reg_alpha}, L2 (reg_lambda): {xgb_reg_lambda}")
+    print(f"    ImportanceThreshold: {xgb_importance_threshold:.0%}, TopN: {xgb_top_n}")
+print("=" * 70)
+
+# =============================================================================
+# VALIDATE FLOW VARIABLES FOR HEADLESS MODE
+# =============================================================================
+# Check if all required flow variables are present and valid
+
+if (dv is not None and isinstance(dv, str) and dv != "missing" and
+    measures_of_power is not None and isinstance(measures_of_power, str) and measures_of_power != "missing" and
+    num_of_variables is not None and isinstance(num_of_variables, int) and num_of_variables > 0 and
+    criteria is not None and criteria in ['Union', 'Intersection']):
+    
+    # Degree is only required for Intersection criteria
+    if criteria == 'Union':
+        degree = 1  # Not used for Union, set to 1
+        contains_all_vars = True
+        print("[OK] All flow variables valid - HEADLESS mode enabled")
+    elif degree is not None and isinstance(degree, int) and degree > 0:
+        contains_all_vars = True
+        print("[OK] All flow variables valid - HEADLESS mode enabled")
+    else:
+        print("[ERROR] Degree not valid for Intersection criteria")
+else:
+    print("[ERROR] Flow variables incomplete or invalid - would use INTERACTIVE mode")
+    print("  Required: DependentVariable, MeasuresOfPredictivePower, NumberOfVariables, Criteria")
+
+
+# =============================================================================
+# SECTION 20: MAIN PROCESSING LOGIC
+# =============================================================================
+# This section runs either headless or interactive mode based on flow variable check.
+
+# Initialize default outputs in case of errors
+measures_out = pd.DataFrame()      # Output 1: Measures table
+selected_data = df.copy()          # Output 2: Selected data
+ebm_report_out = pd.DataFrame()    # Output 3: EBM/ML report
+corr_matrix = pd.DataFrame()       # Output 4: Correlation matrix
+vif_report = pd.DataFrame()        # Output 5: VIF report
+removed_for_vif = []               # List of removed variable names
+
+try:
+    if contains_all_vars:
+        # =====================================================================
+        # HEADLESS MODE - All required flow variables are present
+        # =====================================================================
+        print("Running in HEADLESS mode")
+        
+        # Parse comma-separated measures string into list
+        # e.g., "EntropyExplained, InformationValue, Gini" -> ['EntropyExplained', 'InformationValue', 'Gini']
+        measures_list = [m.strip() for m in measures_of_power.split(',')]
+        
+        # Run the headless selection function with all parameters
+        results = run_headless_selection(
+            df=df,
+            dv=dv,
+            measures_to_calc=measures_list,
+            num_of_variables=num_of_variables,
+            criteria=criteria,
+            degree=degree,
+            max_interactions=max_interactions,
+            top_interactions=top_interactions,
+            auto_add_missed=auto_add_missed,
+            max_missed_to_add=max_missed_to_add,
+            vif_threshold=vif_threshold,
+            use_xgboost=use_xgboost,
+            xgb_n_estimators=xgb_n_estimators,
+            xgb_max_depth=xgb_max_depth,
+            xgb_learning_rate=xgb_learning_rate,
+            xgb_colsample=xgb_colsample,
+            xgb_subsample=xgb_subsample,
+            xgb_reg_alpha=xgb_reg_alpha,
+            xgb_reg_lambda=xgb_reg_lambda,
+            xgb_importance_threshold=xgb_importance_threshold,
+            xgb_top_n=xgb_top_n,
+            xgb_num_gpus=xgb_num_gpus
+        )
+        
+        # Extract results
+        measures_out = results['measures']
+        selected_data = results['selected_data']
+        ebm_report_out = results['ebm_report']
+        corr_matrix = results['correlation_matrix']
+        vif_report = results['vif_report']
+        removed_for_vif = results.get('removed_for_vif', [])
+        
+    else:
+        # =====================================================================
+        # INTERACTIVE MODE - Launch Shiny UI
+        # =====================================================================
+        if SHINY_AVAILABLE:
+            print("Running in INTERACTIVE mode - launching Shiny UI...")
+            results = run_variable_selection(df)
+        else:
+            # Shiny not available - print instructions and return empty results
+            print("=" * 70)
+            print("ERROR: Interactive mode requires Shiny, but Shiny is not available.")
+            print("Please provide flow variables for headless mode:")
+            print("  - DependentVariable (string): e.g., 'IsFPD'")
+            print("  - MeasuresOfPredictivePower (string): e.g., 'EntropyExplained, InformationValue, Gini'")
+            print("  - NumberOfVariables (integer): e.g., 50")
+            print("  - Criteria (string): 'Union' or 'Intersection'")
+            print("  - Degree (integer): e.g., 2 (only needed for Intersection)")
+            print("=" * 70)
+            results = {'completed': False}
+        
+        # Process interactive results
+        if results['completed']:
+            measures_out = results['measures']
+            selected_data = results['selected_data']
+            ebm_report_out = results['ebm_report']
+            corr_matrix = results['correlation_matrix']
+            vif_report = results['vif_report'] if results['vif_report'] is not None else pd.DataFrame()
+            removed_for_vif = results.get('removed_for_vif', [])
+            print("Interactive session completed successfully")
+        else:
+            # User cancelled or Shiny not available
+            print("Interactive session cancelled - returning empty results")
+            measures_out = pd.DataFrame()
+            selected_data = df.copy()
+            ebm_report_out = pd.DataFrame()
+            corr_matrix = pd.DataFrame()
+            vif_report = pd.DataFrame()
+            removed_for_vif = []
+
+except Exception as e:
+    # Catch any errors and print detailed traceback
+    import traceback
+    print("=" * 70)
+    print(f"ERROR during processing: {str(e)}")
+    print("=" * 70)
+    print(traceback.format_exc())
+    print("=" * 70)
+    print("Returning input data as fallback output")
+    # Keep default values initialized above
+
+
+# =============================================================================
+# SECTION 21: OUTPUT TABLES
+# =============================================================================
+# This section prepares and writes the output tables to KNIME.
+
+# Ensure all outputs are valid DataFrames (not None)
+if measures_out is None:
+    measures_out = pd.DataFrame()
+if selected_data is None:
+    selected_data = df.copy()
+if ebm_report_out is None:
+    ebm_report_out = pd.DataFrame()
+if corr_matrix is None:
+    corr_matrix = pd.DataFrame()
+if vif_report is None:
+    vif_report = pd.DataFrame()
+if removed_for_vif is None:
+    removed_for_vif = []
+
+# Ensure VIF report has proper column types for KNIME Arrow conversion
+# KNIME requires specific types for proper display and filtering
+if not vif_report.empty:
+    if 'VIF' in vif_report.columns:
+        # Convert VIF to nullable Float64 type
+        vif_report['VIF'] = pd.to_numeric(vif_report['VIF'], errors='coerce').astype('Float64')
+    if 'R_Squared' in vif_report.columns:
+        vif_report['R_Squared'] = pd.to_numeric(vif_report['R_Squared'], errors='coerce').astype('Float64')
+    if 'Removed' in vif_report.columns:
+        vif_report['Removed'] = vif_report['Removed'].astype(bool)
+    if 'Variable' in vif_report.columns:
+        vif_report['Variable'] = vif_report['Variable'].astype(str)
+    if 'Status' in vif_report.columns:
+        vif_report['Status'] = vif_report['Status'].astype(str)
+
+# Write outputs to KNIME
+# knio.Table.from_pandas() converts DataFrame to KNIME table format
+
+# Output 1: Measures table with selection flags, ranks, and ML importance
+knio.output_tables[0] = knio.Table.from_pandas(measures_out)
+
+# Output 2: Selected data with WOE variables + missed + interactions + DV
+# This is ready for stepwise logistic regression
+knio.output_tables[1] = knio.Table.from_pandas(selected_data)
+
+# Output 3: EBM/XGBoost report (interactions + missed variables with inclusion status)
+knio.output_tables[2] = knio.Table.from_pandas(ebm_report_out)
+
+# Output 4: Correlation matrix for selected variables
+knio.output_tables[3] = knio.Table.from_pandas(corr_matrix)
+
+# Output 5: VIF report for multicollinearity detection
+knio.output_tables[4] = knio.Table.from_pandas(vif_report)
+
+# Print completion summary
+print("=" * 70)
+print("Variable Selection completed successfully")
+print("=" * 70)
+print(f"Output 1 (Measures): {len(measures_out)} variables with ranks and ML importance")
+print(f"Output 2 (Selected Data): {len(selected_data.columns)} columns ready for stepwise regression")
+print(f"Output 3 (ML Discovery Report): {len(ebm_report_out)} entries (EBM + XGBoost interactions + missed vars)")
+print(f"Output 4 (Correlation Matrix): {corr_matrix.shape}")
+print(f"Output 5 (VIF Report): {len(vif_report)} variables checked for multicollinearity")
+
+# Print VIF removal summary if any variables were removed
+if removed_for_vif:
+    print(f"\n[VIF REMOVAL] {len(removed_for_vif)} variables with VIF >= {vif_threshold} automatically removed:")
+    for var in removed_for_vif:
+        print(f"   - {var}")
+
+# Print moderate VIF warning if any remain
+if not vif_report.empty and 'VIF' in vif_report.columns:
+    try:
+        # Count remaining moderate VIF (exclude removed ones)
+        remaining_vif = vif_report[vif_report.get('Removed', False) == False] if 'Removed' in vif_report.columns else vif_report
+        if not remaining_vif.empty:
+            moderate_vif = len(remaining_vif[remaining_vif['VIF'] > 5])
+            if moderate_vif > 0:
+                print(f"\n[MODERATE VIF] {moderate_vif} variables with VIF 5-11 (acceptable but monitor)")
+                print("   These are acceptable but monitor for stability")
+    except:
+        pass
+
+print("=" * 70)
+
+
+# =============================================================================
+# SECTION 22: CLEANUP FOR STABILITY
+# =============================================================================
+# This section cleans up memory to prevent issues with long-running KNIME sessions.
+
+# Flush stdout to ensure all print statements are displayed
+sys.stdout.flush()
+
+# Delete large objects to free memory
+# Using try/except because variables may not exist in all code paths
+
+try:
+    del df  # Original input DataFrame
+except:
+    pass
+
+try:
+    del df_bins  # Binning intermediate data (may not exist)
+except:
+    pass
+
+try:
+    del measures_out  # Measures output
+except:
+    pass
+
+try:
+    del selected_data  # Selected data output
+except:
+    pass
+
+try:
+    del corr_matrix  # Correlation matrix
+except:
+    pass
+
+# Force garbage collection to release memory immediately
+gc.collect()
