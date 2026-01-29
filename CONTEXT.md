@@ -16,6 +16,7 @@ Build Python scripts that run inside **KNIME 5.9 Python Script nodes** for credi
 5. **Model Analyzer** - ROC curves, K-S charts, gains tables for model diagnostics
 6. **Logistic Regression** - Logistic regression with stepwise variable selection (like R's stepAIC)
 7. **Scorecard Generator** - Convert logistic regression + WOE bins into credit scorecard
+8. **Model Performance Monitor** - Production model monitoring with drift detection and retraining recommendations
 
 ---
 
@@ -194,6 +195,76 @@ Build Python scripts that run inside **KNIME 5.9 Python Script nodes** for credi
   coef_df <- data.frame(row.names = names(model$coefficients), 
                         coefficient = model$coefficients)
   ```
+
+### `model_performance_monitor.py`
+- **Status**: Complete (v1.0 - newly created)
+- **Inputs**: 2 tables
+  1. **Production Data** (required): Current period loan performance
+     - `score`: Scorecard points (integer)
+     - `isApproved`: 1=approved, 0=declined
+     - `isFunded`: 1=funded, 0=not funded
+     - `<DependentVariable>`: Actual outcome 0/1 (only for funded loans)
+     - `ROI`: Return on investment (>1=profit, <1=loss, only for funded loans)
+  2. **Baseline Data** (optional): Training data or stable historical period
+     - Same structure as Production Data
+     - Used for PSI calculation and performance comparison
+- **Outputs**: 4 tables
+  1. Performance Summary - Key metrics with alerts (AUC, Gini, K-S, PSI, bad rate, ROI, Recommendation)
+  2. Decile Analysis - Performance by score decile
+  3. Calibration Table - Expected vs observed bad rates by score band
+  4. Production Data with Diagnostics - Original data + probability, prediction_correct, score_decile
+- **Flow Variables** (for headless mode):
+  - `DependentVariable` (string, required): Name of actual outcome column
+  - `ScoreColumn` (string, default "score"): Name of score column
+  - `ApprovalColumn` (string, default "isApproved"): Name of approval column
+  - `FundedColumn` (string, default "isFunded"): Name of funded column
+  - `ROIColumn` (string, default "ROI"): Name of ROI column
+  - Scorecard Parameters (for probability calculation):
+    - `Points` (int, default 600): Base score at target odds
+    - `Odds` (int, default 20): Target odds ratio (1:X)
+    - `PDO` (int, default 50): Points to Double the Odds
+  - Alert Thresholds:
+    - `PSI_Warning` (float, default 0.1): PSI threshold for "MONITOR"
+    - `PSI_Critical` (float, default 0.25): PSI threshold for "RETRAIN"
+    - `AUC_Decline_Warning` (float, default 0.03): AUC decline for "MONITOR"
+    - `AUC_Decline_Critical` (float, default 0.05): AUC decline for "RETRAIN"
+    - `KS_Decline_Warning` (float, default 0.05): K-S decline for "MONITOR"
+    - `KS_Decline_Critical` (float, default 0.10): K-S decline for "RETRAIN"
+    - `BadRate_Increase_Warning` (float, default 0.02): Bad rate increase threshold
+    - `CalibrationError_Warning` (float, default 0.05): Calibration error threshold
+    - `MinSampleSize` (int, default 500): Minimum funded loans for reliable metrics
+- **Key Metrics Calculated**:
+  - **Discrimination**: AUC, Gini, K-S statistic
+  - **Population Stability**: PSI (Population Stability Index)
+  - **Calibration**: Expected vs observed rates by score band, calibration error
+  - **Business**: Approval rate, bad rate (funded), average ROI, loss rate
+  - **Recommendation**: OK, MONITOR, or RETRAIN based on threshold logic
+- **Features**:
+  - Shiny for Python interactive UI with threshold adjustment
+  - Score-to-probability conversion using inverse scorecard formula
+  - Automatic recommendation logic based on configurable thresholds
+  - Decile-level performance analysis
+  - Calibration analysis across probability bins
+  - Sample size warnings for small datasets
+  - Baseline comparison for drift detection
+- **Score-to-Probability Formula**:
+  ```python
+  # Given scorecard parameters (Points, Odds, PDO):
+  b = PDO / log(2)
+  a = Points + b * log(odds0)
+  log_odds = (a - score) / b
+  probability = 1 / (1 + exp(-log_odds))
+  ```
+- **Recommendation Logic**:
+  - **OK**: PSI < 0.1, AUC decline < 3%, K-S decline < 5%, calibration error < 5%
+  - **MONITOR**: PSI 0.1-0.25, AUC decline 3-5%, K-S decline 5-10%, bad rate increase ≥ 2%
+  - **RETRAIN**: PSI ≥ 0.25, AUC decline ≥ 5%, K-S decline ≥ 10%
+- **Usage Notes**:
+  - Provide baseline data for PSI and comparative metrics
+  - Without baseline: calculates absolute metrics only (no drift detection)
+  - Requires at least 500 funded loans for reliable metrics
+  - Scorecard parameters must match those used in Scorecard Generator node
+- **Documentation**: See `model_performance_monitor/README.md` and `BASELINE_STRATEGY.md`
 
 ### `scorecard_knime.py`
 - **Status**: Complete (needs testing)
