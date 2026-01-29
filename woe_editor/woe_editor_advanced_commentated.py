@@ -3282,3 +3282,1171 @@ def add_woe_columns(
                                 break
     
     return result_df
+
+
+# =============================================================================
+# Shiny UI Application
+# =============================================================================
+# This section creates an interactive web-based user interface using the Shiny
+# framework. The UI allows users to visually explore binning results, modify
+# bins, and approve the final configuration before outputting results.
+
+def create_woe_editor_app(df: pd.DataFrame, min_prop: float = 0.05):
+    """
+    Create the WOE Editor Shiny application.
+    
+    This function builds a complete web application for interactive WOE binning.
+    The UI includes:
+    - Variable selection dropdowns
+    - Buttons for bin operations (Group NA, Break, Reset, Optimize)
+    - Interactive charts showing WOE and bad rates
+    - A measurements table with IV and other statistics
+    - A "Run & Close" button to finalize and exit
+    
+    Parameters:
+        df (pd.DataFrame): The input data to create bins for.
+        min_prop (float): Minimum proportion for binning (default 5%).
+    
+    Returns:
+        Tuple[App, dict]: The Shiny App object and a results dictionary.
+    """
+    
+    # Dictionary to store results when user clicks "Run & Close"
+    # This allows us to return data from the Shiny session
+    app_results = {
+        'df_with_woe': None,    # Full data with WOE columns
+        'df_only_woe': None,    # Just WOE columns + target
+        'bins': None,            # Binning rules
+        'dv': None,              # Dependent variable name
+        'completed': False       # Flag to indicate successful completion
+    }
+    
+    # ==========================================================================
+    # Define the UI Layout
+    # ==========================================================================
+    # The UI is built using Shiny's declarative syntax. Each ui.* function
+    # creates a UI element that will be rendered in the browser.
+    
+    app_ui = ui.page_fluid(
+        # <head> section - add custom CSS styling
+        ui.tags.head(
+            ui.tags.style("""
+                @import url('https://fonts.googleapis.com/css?family=Raleway');
+                body { font-family: 'Raleway', sans-serif; background-color: #f5f5f5; }
+                .card { background: white; border-radius: 8px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                .btn-primary { background-color: #2E86AB; border-color: #2E86AB; }
+                .btn-success { background-color: #28A745; border-color: #28A745; }
+                .btn-danger { background-color: #DC3545; border-color: #DC3545; }
+                .btn-secondary { background-color: #6C757D; border-color: #6C757D; }
+                .btn-dark { background-color: #343A40; border-color: #343A40; }
+                .btn-info { background-color: #17A2B8; border-color: #17A2B8; }
+                h4 { font-weight: bold; text-align: center; margin: 20px 0; color: #2E86AB; }
+                .divider { width: 10px; display: inline-block; }
+                .algorithm-badge { 
+                    background: linear-gradient(135deg, #2E86AB, #1A5276);
+                    color: white; 
+                    padding: 5px 15px; 
+                    border-radius: 20px; 
+                    font-size: 12px;
+                    margin-left: 10px;
+                }
+            """)
+        ),
+        
+        # Page title with algorithm badge
+        ui.h4(
+            "WOE Editor",
+            ui.span("ChiMerge + Monotonic", class_="algorithm-badge")
+        ),
+        
+        # Card 1: Variable Selection
+        # Users select the dependent (target) variable and which category is "bad"
+        ui.div(
+            {"class": "card"},
+            ui.row(
+                ui.column(6,
+                    # Dropdown to select the binary target variable
+                    ui.input_select("dv", "Dependent Variable", 
+                                   choices=list(df.columns),
+                                   selected=df.columns[0] if len(df.columns) > 0 else None)
+                ),
+                ui.column(6,
+                    # Dropdown to select which value represents "bad" (default: max value)
+                    ui.input_select("tc", "Target Category", choices=[])
+                )
+            )
+        ),
+        
+        # Card 2: Independent Variable Selection and Actions
+        ui.div(
+            {"class": "card"},
+            ui.row(
+                ui.column(6,
+                    # Dropdown to select which variable to view/edit
+                    ui.input_select("iv", "Independent Variable", choices=[]),
+                    ui.div(
+                        # Navigation buttons to cycle through variables
+                        ui.input_action_button("prev_btn", "← Previous", class_="btn btn-secondary"),
+                        ui.span(" ", class_="divider"),
+                        ui.input_action_button("next_btn", "Next →", class_="btn btn-success"),
+                    )
+                ),
+                ui.column(6,
+                    ui.div(
+                        # Bin manipulation buttons
+                        ui.input_action_button("group_na_btn", "Group NA", class_="btn btn-primary"),
+                        ui.span(" ", class_="divider"),
+                        ui.input_action_button("break_btn", "Break Bin", class_="btn btn-danger"),
+                        ui.span(" ", class_="divider"),
+                        ui.input_action_button("reset_btn", "Reset", class_="btn btn-danger"),
+                    ),
+                    ui.br(),
+                    ui.div(
+                        # Optimization buttons
+                        ui.input_action_button("optimize_btn", "Optimize", class_="btn btn-dark"),
+                        ui.span(" ", class_="divider"),
+                        ui.input_action_button("optimize_all_btn", "Optimize All", class_="btn btn-dark"),
+                    ),
+                )
+            )
+        ),
+        
+        # Row 3: Bin Details Table and WOE Graph
+        ui.row(
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 450px; overflow-y: auto;"},
+                    ui.h5("Bin Details"),
+                    # Reactive table showing bin statistics
+                    ui.output_data_frame("woe_table")
+                )
+            ),
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 450px;"},
+                    ui.h5("WOE & Bad Rate"),
+                    # Plotly chart showing WOE trend and bad rates
+                    output_widget("woe_graph")
+                )
+            )
+        ),
+        
+        # Row 4: Count and Proportion Charts
+        ui.row(
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 350px;"},
+                    # Stacked bar chart of good/bad counts
+                    output_widget("count_bar")
+                )
+            ),
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 350px;"},
+                    # Grouped bar chart of good/bad proportions
+                    output_widget("prop_bar")
+                )
+            )
+        ),
+        
+        # Card: Measurements Table (IV, Entropy, Trend for all variables)
+        ui.div(
+            {"class": "card"},
+            ui.h5("Measurements"),
+            ui.output_data_frame("measurements_table")
+        ),
+        
+        # Card: Run Button (finalizes binning and closes the app)
+        ui.div(
+            {"class": "card", "style": "text-align: center;"},
+            ui.input_action_button("run_btn", "Run & Close", class_="btn btn-success btn-lg"),
+        ),
+    )
+    
+    # ==========================================================================
+    # Define the Server Logic
+    # ==========================================================================
+    # The server function contains all the reactive logic that responds to
+    # user interactions and updates the UI accordingly.
+    
+    def server(input: Inputs, output: Outputs, session: Session):
+        # Reactive values store state that can change and trigger UI updates
+        bins_rv = reactive.Value(None)           # Current variable's bins
+        all_bins_rv = reactive.Value(None)       # Original binning results
+        all_bins_mod_rv = reactive.Value(None)   # Modified binning results
+        modified_action_rv = reactive.Value(False)  # Track if user made changes
+        initial_bins_rv = reactive.Value(None)   # Initial state for reset
+        
+        # --------------------------------------------------------------------
+        # Reactive effect: Update target category choices when DV changes
+        # --------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.dv)
+        def update_tc():
+            dv = input.dv()
+            if dv and dv in df.columns:
+                # Get unique values in the target variable
+                unique_vals = df[dv].dropna().unique().tolist()
+                # Default to max value (usually 1 for binary targets)
+                ui.update_select("tc", choices=unique_vals, 
+                               selected=max(unique_vals) if unique_vals else None)
+                
+                # Update independent variable list (all columns except DV)
+                iv_list = [col for col in df.columns if col != dv]
+                ui.update_select("iv", choices=iv_list, 
+                               selected=iv_list[0] if iv_list else None)
+        
+        # --------------------------------------------------------------------
+        # Reactive effect: Initialize binning when target category is set
+        # --------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.tc)
+        def init_bins():
+            dv = input.dv()
+            tc = input.tc()
+            
+            if not dv or dv not in df.columns:
+                return
+            
+            iv_list = [col for col in df.columns if col != dv]
+            
+            # Compute initial binning for all variables
+            result = get_bins(df, dv, iv_list, min_prop=min_prop, enforce_monotonic=True)
+            
+            # Store results in reactive values
+            all_bins_rv.set(result)
+            all_bins_mod_rv.set(result)
+            initial_bins_rv.set(result)
+            
+            # Update current variable display
+            if input.iv() and input.iv() in iv_list:
+                var = input.iv()
+                var_bin = result.bin[result.bin['var'] == var].copy()
+                bins_rv.set(var_bin)
+        
+        # --------------------------------------------------------------------
+        # Reactive effect: Update displayed bins when variable selection changes
+        # --------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.iv)
+        def update_var_bins():
+            var = input.iv()
+            all_bins = all_bins_mod_rv.get()
+            
+            if var and all_bins is not None:
+                var_bin = all_bins.bin[all_bins.bin['var'] == var].copy()
+                bins_rv.set(var_bin)
+        
+        # --------------------------------------------------------------------
+        # Navigation buttons: Previous and Next variable
+        # --------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.prev_btn)
+        def go_prev():
+            dv = input.dv()
+            current = input.iv()
+            iv_list = [col for col in df.columns if col != dv]
+            
+            if current in iv_list:
+                idx = iv_list.index(current)
+                new_idx = (idx - 1) % len(iv_list)  # Wrap around
+                ui.update_select("iv", selected=iv_list[new_idx])
+        
+        @reactive.Effect
+        @reactive.event(input.next_btn)
+        def go_next():
+            dv = input.dv()
+            current = input.iv()
+            iv_list = [col for col in df.columns if col != dv]
+            
+            if current in iv_list:
+                idx = iv_list.index(current)
+                new_idx = (idx + 1) % len(iv_list)  # Wrap around
+                ui.update_select("iv", selected=iv_list[new_idx])
+        
+        # --------------------------------------------------------------------
+        # Bin manipulation buttons
+        # --------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.group_na_btn)
+        def do_group_na():
+            """Combine NA bin with closest bin by bad rate."""
+            var = input.iv()
+            all_bins = all_bins_mod_rv.get()
+            
+            if var and all_bins is not None:
+                new_bins = na_combine(all_bins, var)
+                all_bins_mod_rv.set(new_bins)
+                var_bin = new_bins.bin[new_bins.bin['var'] == var].copy()
+                bins_rv.set(var_bin)
+                modified_action_rv.set(True)
+        
+        @reactive.Effect
+        @reactive.event(input.break_btn)
+        def do_break():
+            """Reset variable to one bin per unique value."""
+            var = input.iv()
+            dv = input.dv()
+            all_bins = all_bins_mod_rv.get()
+            
+            if var and dv and all_bins is not None:
+                new_bins = break_bin(all_bins, var, dv, df)
+                all_bins_mod_rv.set(new_bins)
+                var_bin = new_bins.bin[new_bins.bin['var'] == var].copy()
+                bins_rv.set(var_bin)
+                modified_action_rv.set(True)
+        
+        @reactive.Effect
+        @reactive.event(input.reset_btn)
+        def do_reset():
+            """Reset all binning to initial state."""
+            initial = initial_bins_rv.get()
+            if initial is not None:
+                all_bins_mod_rv.set(initial)
+                var = input.iv()
+                if var:
+                    var_bin = initial.bin[initial.bin['var'] == var].copy()
+                    bins_rv.set(var_bin)
+                modified_action_rv.set(False)
+        
+        @reactive.Effect
+        @reactive.event(input.optimize_btn)
+        def do_optimize():
+            """Force monotonic trend on current variable."""
+            var = input.iv()
+            all_bins = all_bins_mod_rv.get()
+            
+            if var and all_bins is not None:
+                var_summary = all_bins.var_summary
+                var_row = var_summary[var_summary['var'] == var]
+                
+                if not var_row.empty:
+                    # Determine trend direction and force it
+                    trend = var_row.iloc[0]['trend']
+                    if trend == 'D':
+                        new_bins = force_decr_trend(all_bins, var)
+                    else:
+                        new_bins = force_incr_trend(all_bins, var)
+                    
+                    all_bins_mod_rv.set(new_bins)
+                    var_bin = new_bins.bin[new_bins.bin['var'] == var].copy()
+                    bins_rv.set(var_bin)
+                    modified_action_rv.set(True)
+        
+        @reactive.Effect
+        @reactive.event(input.optimize_all_btn)
+        def do_optimize_all():
+            """Optimize all variables: combine NAs and force monotonic trends."""
+            all_bins = all_bins_mod_rv.get()
+            
+            if all_bins is not None:
+                # First combine NAs for all variables
+                bins_mod = na_combine(all_bins, all_bins.var_summary['var'].tolist())
+                
+                # Force decreasing trend for D variables
+                decr_vars = bins_mod.var_summary[bins_mod.var_summary['trend'] == 'D']['var'].tolist()
+                if decr_vars:
+                    bins_mod = force_decr_trend(bins_mod, decr_vars)
+                
+                # Force increasing trend for I variables
+                incr_vars = bins_mod.var_summary[bins_mod.var_summary['trend'] == 'I']['var'].tolist()
+                if incr_vars:
+                    bins_mod = force_incr_trend(bins_mod, incr_vars)
+                
+                all_bins_mod_rv.set(bins_mod)
+                
+                # Update current variable display
+                var = input.iv()
+                if var:
+                    var_bin = bins_mod.bin[bins_mod.bin['var'] == var].copy()
+                    bins_rv.set(var_bin)
+                
+                modified_action_rv.set(True)
+        
+        # --------------------------------------------------------------------
+        # Run & Close button: Finalize and output results
+        # --------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.run_btn)
+        def do_run():
+            """Apply WOE transformation and close the app."""
+            all_bins = all_bins_mod_rv.get()
+            dv = input.dv()
+            
+            if all_bins is not None and dv:
+                # Get final binning rules (exclude Total rows)
+                rules = all_bins.bin[all_bins.bin['bin'] != 'Total'].copy()
+                
+                # Calculate WOE for each bin
+                rules['woe'] = calculate_woe(rules['goods'].values, rules['bads'].values,
+                                            use_shrinkage=BinningConfig.USE_SHRINKAGE,
+                                            shrinkage_strength=BinningConfig.SHRINKAGE_STRENGTH)
+                
+                # Add bin value column for each variable
+                for var in all_bins.var_summary['var'].tolist():
+                    var_mask = rules['var'] == var
+                    rules.loc[var_mask, 'binValue'] = rules.loc[var_mask, 'bin'].apply(
+                        lambda x: x.replace(var, '').replace(' %in% c', '').strip()
+                    )
+                
+                # Apply binning to create binned and WOE columns
+                all_vars = all_bins.var_summary['var'].tolist()
+                df_with_bins = create_binned_columns(all_bins, df, all_vars)
+                df_woe = add_woe_columns(df_with_bins, rules, all_vars)
+                
+                # Create WOE-only DataFrame
+                woe_cols = [col for col in df_woe.columns if col.startswith('WOE_')]
+                df_only = df_woe[woe_cols + [dv]].copy()
+                
+                # Store results
+                app_results['df_with_woe'] = df_woe
+                app_results['df_only_woe'] = df_only
+                app_results['bins'] = rules
+                app_results['dv'] = dv
+                app_results['completed'] = True
+                
+                # Close the Shiny session
+                import asyncio
+                asyncio.get_event_loop().call_soon(session.close)
+        
+        # --------------------------------------------------------------------
+        # Output renderers: Tables and Charts
+        # --------------------------------------------------------------------
+        @output
+        @render.data_frame
+        def woe_table():
+            """Render the bin details table."""
+            var_bin = bins_rv.get()
+            if var_bin is not None and not var_bin.empty:
+                display_df = var_bin[['bin', 'count', 'bads', 'goods', 'propn', 'bad_rate']].copy()
+                display_df.columns = ['Bin', 'Count', 'Bads', 'Goods', 'Propn%', 'BadRate%']
+                return render.DataGrid(display_df, width="100%")
+            return render.DataGrid(pd.DataFrame())
+        
+        @output
+        @render_plotly
+        def woe_graph():
+            """Render the WOE and Bad Rate chart."""
+            var_bin = bins_rv.get()
+            if var_bin is None or var_bin.empty:
+                return go.Figure()
+            
+            # Exclude Total row for plotting
+            plot_data = var_bin[var_bin['bin'] != 'Total'].copy()
+            if plot_data.empty:
+                return go.Figure()
+            
+            # Calculate WOE for display
+            woe_vals = calculate_woe(plot_data['goods'].values, plot_data['bads'].values,
+                                    use_shrinkage=BinningConfig.USE_SHRINKAGE)
+            plot_data['woe'] = woe_vals
+            
+            # Create dual-axis chart: bars for bad rate, line for WOE
+            fig = go.Figure()
+            
+            # Bar chart for bad rate
+            fig.add_trace(go.Bar(
+                x=list(range(len(plot_data))),
+                y=plot_data['bad_rate'],
+                name='Bad Rate %',
+                marker_color='#2E86AB',
+                yaxis='y'
+            ))
+            
+            # Line chart for WOE
+            fig.add_trace(go.Scatter(
+                x=list(range(len(plot_data))),
+                y=plot_data['woe'],
+                name='WOE',
+                mode='lines+markers',
+                marker_color='#E74C3C',
+                yaxis='y2'
+            ))
+            
+            # Configure layout with dual y-axes
+            fig.update_layout(
+                yaxis=dict(title='Bad Rate %', side='left'),
+                yaxis2=dict(title='WOE', side='right', overlaying='y'),
+                legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                margin=dict(l=50, r=50, t=30, b=30),
+                height=380
+            )
+            
+            return fig
+        
+        @output
+        @render_plotly
+        def count_bar():
+            """Render the Good/Bad counts stacked bar chart."""
+            var_bin = bins_rv.get()
+            if var_bin is None or var_bin.empty:
+                return go.Figure()
+            
+            plot_data = var_bin[var_bin['bin'] != 'Total'].copy()
+            if plot_data.empty:
+                return go.Figure()
+            
+            fig = go.Figure()
+            
+            # Stacked bar: goods on bottom, bads on top
+            fig.add_trace(go.Bar(
+                x=list(range(len(plot_data))),
+                y=plot_data['goods'],
+                name='Goods',
+                marker_color='#28A745'
+            ))
+            
+            fig.add_trace(go.Bar(
+                x=list(range(len(plot_data))),
+                y=plot_data['bads'],
+                name='Bads',
+                marker_color='#DC3545'
+            ))
+            
+            fig.update_layout(
+                barmode='stack',
+                title='Good/Bad Counts',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                margin=dict(l=50, r=50, t=50, b=30),
+                height=300
+            )
+            
+            return fig
+        
+        @output
+        @render_plotly
+        def prop_bar():
+            """Render the Good/Bad distribution percentage chart."""
+            var_bin = bins_rv.get()
+            if var_bin is None or var_bin.empty:
+                return go.Figure()
+            
+            plot_data = var_bin[var_bin['bin'] != 'Total'].copy()
+            if plot_data.empty:
+                return go.Figure()
+            
+            # Calculate percentages of total goods and bads
+            total_goods = plot_data['goods'].sum()
+            total_bads = plot_data['bads'].sum()
+            
+            plot_data['goodCap'] = plot_data['goods'] / total_goods * 100 if total_goods > 0 else 0
+            plot_data['badCap'] = plot_data['bads'] / total_bads * 100 if total_bads > 0 else 0
+            
+            fig = go.Figure()
+            
+            # Grouped bar: side-by-side comparison
+            fig.add_trace(go.Bar(
+                x=list(range(len(plot_data))),
+                y=plot_data['goodCap'],
+                name='Good %',
+                marker_color='#28A745'
+            ))
+            
+            fig.add_trace(go.Bar(
+                x=list(range(len(plot_data))),
+                y=plot_data['badCap'],
+                name='Bad %',
+                marker_color='#DC3545'
+            ))
+            
+            fig.update_layout(
+                barmode='group',
+                title='Good/Bad Distribution %',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                margin=dict(l=50, r=50, t=50, b=30),
+                height=300
+            )
+            
+            return fig
+        
+        @output
+        @render.data_frame
+        def measurements_table():
+            """Render the variable summary measurements table."""
+            all_bins = all_bins_mod_rv.get()
+            if all_bins is not None and not all_bins.var_summary.empty:
+                display_df = all_bins.var_summary[['var', 'iv', 'ent', 'trend', 'monTrend', 'numBins']].copy()
+                display_df.columns = ['Variable', 'IV', 'Entropy', 'Trend', 'Monotonic', 'Bins']
+                display_df = display_df.sort_values('IV', ascending=False)
+                return render.DataGrid(display_df, width="100%")
+            return render.DataGrid(pd.DataFrame())
+    
+    # Create and return the Shiny App
+    return App(app_ui, server), app_results
+
+
+def run_woe_editor(df: pd.DataFrame, min_prop: float = 0.05) -> Dict[str, Any]:
+    """
+    Run the WOE editor interactively and return results.
+    
+    This function launches a Shiny web application in a browser, waits for
+    the user to finish editing bins, and returns the results.
+    
+    Parameters:
+        df (pd.DataFrame): The input data to process.
+        min_prop (float): Minimum bin proportion (default 5%).
+    
+    Returns:
+        Dict[str, Any]: Dictionary with keys:
+            - 'df_with_woe': DataFrame with WOE columns added
+            - 'df_only_woe': DataFrame with only WOE columns + target
+            - 'bins': Binning rules DataFrame
+            - 'dv': Dependent variable name
+            - 'completed': Boolean indicating if user finished successfully
+    """
+    import socket
+    import webbrowser
+    
+    # Find an available port by trying to bind to it
+    # Start with BASE_PORT and add a random offset to avoid conflicts
+    port = BASE_PORT + random.randint(0, RANDOM_PORT_RANGE)
+    
+    # Try up to 10 times to find an available port
+    for attempt in range(10):
+        try:
+            # Try to create a socket and bind to the port
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(('127.0.0.1', port))
+            sock.close()
+            break  # Port is available
+        except OSError:
+            # Port in use, try another random port
+            port = BASE_PORT + random.randint(0, RANDOM_PORT_RANGE)
+    
+    log_progress(f"Starting Shiny UI on port {port} (Instance: {INSTANCE_ID})")
+    
+    # Create the Shiny app
+    app, results = create_woe_editor_app(df, min_prop)
+    
+    # Open the browser to the app URL
+    webbrowser.open(f'http://127.0.0.1:{port}')
+    
+    # Run the app (blocks until session ends)
+    app.run(host='127.0.0.1', port=port)
+    
+    return results
+
+
+# =============================================================================
+# Read Input Data
+# =============================================================================
+# This is where the KNIME node's main execution begins.
+# We read the input table from KNIME and convert it to a pandas DataFrame.
+
+# Read the first input port (index 0) and convert to pandas DataFrame
+# This is the primary data input containing the variables to bin
+df = knio.input_tables[0].to_pandas()
+
+# Set default min_prop from config (1% for fraud-friendly binning)
+min_prop = BinningConfig.MIN_BIN_PCT
+
+# =============================================================================
+# Check for Flow Variables
+# =============================================================================
+# Flow variables in KNIME allow passing parameters between nodes.
+# If DependentVariable is set, we run in headless (automated) mode.
+# If not set, we run in interactive mode with the Shiny UI.
+
+# Initialize control flags
+contains_dv = False  # Will be True if DependentVariable flow variable exists
+dv = None            # Dependent variable name
+target = None        # Target category (which value = "bad")
+optimize_all = False # Whether to force monotonic trends on all variables
+group_na = False     # Whether to combine NA bins with closest bin
+
+# Try to read DependentVariable flow variable
+# This is the binary target column (e.g., "DefaultFlag", "IsBad")
+try:
+    dv = knio.flow_variables.get("DependentVariable", None)
+except:
+    pass
+
+# Try to read TargetCategory flow variable
+# This specifies which value represents "bad" (usually 1)
+try:
+    target = knio.flow_variables.get("TargetCategory", None)
+except:
+    pass
+
+# Try to read OptimizeAll flow variable
+# If True, force monotonic trends on all variables automatically
+try:
+    optimize_all = knio.flow_variables.get("OptimizeAll", False)
+except:
+    pass
+
+# Try to read GroupNA flow variable
+# If True, merge NA bins with the closest non-NA bin
+try:
+    group_na = knio.flow_variables.get("GroupNA", False)
+except:
+    pass
+
+# Read tuning parameters for fraud/credit scoring
+min_bin_pct = BinningConfig.MIN_BIN_PCT
+min_bin_count = BinningConfig.MIN_BIN_COUNT
+
+# MinBinPct: Minimum percentage of observations per bin (0.01 = 1%, 0.05 = 5%)
+try:
+    min_bin_pct_fv = knio.flow_variables.get("MinBinPct", None)
+    if min_bin_pct_fv is not None:
+        min_bin_pct = float(min_bin_pct_fv)
+        BinningConfig.MIN_BIN_PCT = min_bin_pct
+except:
+    pass
+
+# MinBinCount: Minimum absolute count per bin
+try:
+    min_bin_count_fv = knio.flow_variables.get("MinBinCount", None)
+    if min_bin_count_fv is not None:
+        min_bin_count = int(min_bin_count_fv)
+        BinningConfig.MIN_BIN_COUNT = min_bin_count
+except:
+    pass
+
+# UseShrinkage: Apply Bayesian shrinkage to WOE values (stabilizes estimates for low counts)
+try:
+    use_shrinkage_fv = knio.flow_variables.get("UseShrinkage", None)
+    if use_shrinkage_fv is not None:
+        BinningConfig.USE_SHRINKAGE = bool(use_shrinkage_fv)
+except:
+    pass
+
+# Algorithm: Which binning algorithm to use
+# Options: "DecisionTree" (R-compatible), "ChiMerge", "IVOptimal"
+try:
+    algorithm_fv = knio.flow_variables.get("Algorithm", None)
+    if algorithm_fv is not None and algorithm_fv in ["DecisionTree", "ChiMerge", "IVOptimal"]:
+        BinningConfig.ALGORITHM = algorithm_fv
+except:
+    pass
+
+# UseEnhancements: Master switch to enable all advanced enhancements
+try:
+    use_enhancements_fv = knio.flow_variables.get("UseEnhancements", None)
+    if use_enhancements_fv is not None:
+        BinningConfig.USE_ENHANCEMENTS = bool(use_enhancements_fv)
+        # When master switch is enabled, enable all individual enhancements
+        if BinningConfig.USE_ENHANCEMENTS:
+            BinningConfig.ADAPTIVE_MIN_PROP = True
+            BinningConfig.MIN_EVENT_COUNT = True
+            BinningConfig.AUTO_RETRY = True
+            BinningConfig.CHI_SQUARE_VALIDATION = True
+            BinningConfig.SINGLE_BIN_PROTECTION = True
+except:
+    pass
+
+# =============================================================================
+# Individual Enhancement Flow Variables (can override master switch)
+# =============================================================================
+# These allow fine-grained control over which enhancements are enabled
+
+# AdaptiveMinProp: Relaxes min_prop for sparse data (< 500 samples)
+try:
+    adaptive_min_prop_fv = knio.flow_variables.get("AdaptiveMinProp", None)
+    if adaptive_min_prop_fv is not None:
+        BinningConfig.ADAPTIVE_MIN_PROP = bool(adaptive_min_prop_fv)
+except:
+    pass
+
+# MinEventCount: Ensures at least N events per potential bin
+try:
+    min_event_count_fv = knio.flow_variables.get("MinEventCount", None)
+    if min_event_count_fv is not None:
+        BinningConfig.MIN_EVENT_COUNT = bool(min_event_count_fv)
+except:
+    pass
+
+# AutoRetry: Retry with relaxed constraints if no splits found
+try:
+    auto_retry_fv = knio.flow_variables.get("AutoRetry", None)
+    if auto_retry_fv is not None:
+        BinningConfig.AUTO_RETRY = bool(auto_retry_fv)
+except:
+    pass
+
+# ChiSquareValidation: Merge statistically similar bins post-binning
+try:
+    chi_square_validation_fv = knio.flow_variables.get("ChiSquareValidation", None)
+    if chi_square_validation_fv is not None:
+        BinningConfig.CHI_SQUARE_VALIDATION = bool(chi_square_validation_fv)
+except:
+    pass
+
+# SingleBinProtection: Prevent na_combine from creating single-bin vars (default ON)
+try:
+    single_bin_protection_fv = knio.flow_variables.get("SingleBinProtection", None)
+    if single_bin_protection_fv is not None:
+        BinningConfig.SINGLE_BIN_PROTECTION = bool(single_bin_protection_fv)
+except:
+    pass
+
+# MaxCategories: Maximum unique categories for categorical variables
+try:
+    max_categories_fv = knio.flow_variables.get("MaxCategories", None)
+    if max_categories_fv is not None:
+        BinningConfig.MAX_CATEGORIES = int(max_categories_fv)
+except:
+    pass
+
+# Check if we should run in headless mode
+# Headless mode runs when DependentVariable is a valid column name
+if dv is not None and isinstance(dv, str) and len(dv) > 0 and dv != "missing":
+    if dv in df.columns:
+        contains_dv = True
+
+# =============================================================================
+# Main Processing Logic
+# =============================================================================
+# This section executes the WOE binning, either in headless or interactive mode.
+
+if contains_dv:
+    # =========================================================================
+    # HEADLESS MODE
+    # =========================================================================
+    # Automated processing without user interaction - used when flow variables
+    # specify all the necessary parameters.
+    
+    log_progress("=" * 60)
+    
+    # Determine if any enhancements are active for display
+    any_enhancement = (BinningConfig.USE_ENHANCEMENTS or 
+                       BinningConfig.ADAPTIVE_MIN_PROP or 
+                       BinningConfig.MIN_EVENT_COUNT or 
+                       BinningConfig.AUTO_RETRY or 
+                       BinningConfig.CHI_SQUARE_VALIDATION)
+    
+    # Set algorithm display name
+    if BinningConfig.ALGORITHM == "DecisionTree":
+        algo_name = "DecisionTree (R-compatible)" if not any_enhancement else "DecisionTree (Enhanced)"
+    else:
+        algo_name = "ChiMerge"
+    
+    # Log configuration
+    log_progress(f"WOE EDITOR - HEADLESS MODE ({algo_name})")
+    log_progress("=" * 60)
+    log_progress(f"Dependent Variable: {dv}")
+    log_progress(f"Algorithm: {BinningConfig.ALGORITHM}")
+    log_progress(f"OptimizeAll: {optimize_all}, GroupNA: {group_na}")
+    log_progress(f"MinBinPct: {BinningConfig.MIN_BIN_PCT:.1%}, MaxBins: {BinningConfig.MAX_BINS}")
+    log_progress(f"MaxCategories: {BinningConfig.MAX_CATEGORIES} (categorical variables with more unique values will be skipped)")
+    
+    if BinningConfig.ALGORITHM == "ChiMerge":
+        log_progress(f"ChiMergeThreshold: {BinningConfig.CHI_MERGE_THRESHOLD}, MinBinCount: {BinningConfig.MIN_BIN_COUNT}")
+    log_progress(f"UseShrinkage: {BinningConfig.USE_SHRINKAGE}")
+    
+    # Log enhancement settings
+    log_progress("Enhancement Settings:")
+    if BinningConfig.USE_ENHANCEMENTS:
+        log_progress(f"  UseEnhancements: True (master switch - all enhancements enabled)")
+    else:
+        log_progress(f"  UseEnhancements: False (individual settings below apply)")
+    log_progress(f"  AdaptiveMinProp: {BinningConfig.ADAPTIVE_MIN_PROP}")
+    log_progress(f"  MinEventCount: {BinningConfig.MIN_EVENT_COUNT}")
+    log_progress(f"  AutoRetry: {BinningConfig.AUTO_RETRY}")
+    log_progress(f"  ChiSquareValidation: {BinningConfig.CHI_SQUARE_VALIDATION}")
+    log_progress(f"  SingleBinProtection: {BinningConfig.SINGLE_BIN_PROTECTION}")
+    
+    # Get list of independent variables (all columns except DV)
+    iv_list = [col for col in df.columns if col != dv]
+    
+    # Filter out constant/zero-variance variables (only 1 unique value)
+    # These variables provide no discriminatory power
+    constant_vars = []
+    valid_vars = []
+    for col in iv_list:
+        n_unique = df[col].dropna().nunique()
+        if n_unique <= 1:
+            constant_vars.append(col)
+        else:
+            valid_vars.append(col)
+    
+    if constant_vars:
+        log_progress(f"Removed {len(constant_vars)} constant variables (only 1 unique value)")
+        if len(constant_vars) <= 10:
+            log_progress(f"  Constant vars: {constant_vars}")
+        else:
+            log_progress(f"  First 10: {constant_vars[:10]}...")
+    
+    iv_list = valid_vars
+    log_progress(f"Variables to process: {len(iv_list)}")
+    
+    # -------------------------------------------------------------------------
+    # Step 1: Initial binning
+    # -------------------------------------------------------------------------
+    step_start = time.time()
+    if BinningConfig.ALGORITHM == "DecisionTree":
+        algo_desc = "DecisionTree (R-compatible)" if not any_enhancement else "DecisionTree (Enhanced)"
+    else:
+        algo_desc = "ChiMerge"
+    log_progress(f"STEP 1/6: Computing initial bins ({algo_desc})...")
+    
+    # Run the main binning function
+    bins_result = get_bins(
+        df, dv, iv_list, 
+        min_prop=BinningConfig.MIN_BIN_PCT, 
+        max_bins=BinningConfig.MAX_BINS,
+        enforce_monotonic=True, 
+        algorithm=BinningConfig.ALGORITHM,
+        use_enhancements=BinningConfig.USE_ENHANCEMENTS,
+        adaptive_min_prop=BinningConfig.ADAPTIVE_MIN_PROP,
+        min_event_count=BinningConfig.MIN_EVENT_COUNT,
+        auto_retry=BinningConfig.AUTO_RETRY
+    )
+    log_progress(f"STEP 1/6 complete in {format_time(time.time() - step_start)}")
+    
+    # -------------------------------------------------------------------------
+    # Step 2: Merge pure bins (always - prevents infinite WOE)
+    # -------------------------------------------------------------------------
+    step_start = time.time()
+    
+    # Count variables with pure bins (bins where goods=0 or bads=0)
+    if 'purNode' in bins_result.var_summary.columns:
+        pure_count = (bins_result.var_summary['purNode'] == 'Y').sum()
+    else:
+        pure_count = 0
+    
+    if pure_count > 0:
+        log_progress(f"STEP 2/6: Merging {int(pure_count)} pure bins (prevents infinite WOE)...")
+        bins_result = merge_pure_bins(bins_result)
+        log_progress(f"STEP 2/6 complete in {format_time(time.time() - step_start)}")
+    else:
+        log_progress("STEP 2/6: Skipped (no pure bins found)")
+    
+    # -------------------------------------------------------------------------
+    # Step 3: Chi-square validation (ENHANCEMENT - only if enabled)
+    # -------------------------------------------------------------------------
+    if BinningConfig.CHI_SQUARE_VALIDATION:
+        step_start = time.time()
+        log_progress("STEP 3/6: Validating bins with chi-square test (merge similar bins)...")
+        bins_result = validate_bins_chi_square(bins_result, p_value_threshold=0.10)
+        log_progress(f"STEP 3/6 complete in {format_time(time.time() - step_start)}")
+    else:
+        log_progress("STEP 3/6: Skipped (ChiSquareValidation=False)")
+    
+    # -------------------------------------------------------------------------
+    # Step 4: Group NA (optional)
+    # -------------------------------------------------------------------------
+    if group_na:
+        step_start = time.time()
+        log_progress("STEP 4/6: Grouping NA values...")
+        if BinningConfig.SINGLE_BIN_PROTECTION:
+            log_progress("  (SingleBinProtection enabled - will skip vars that would become single-bin)")
+        bins_result = na_combine(
+            bins_result, 
+            bins_result.var_summary['var'].tolist(),
+            prevent_single_bin=BinningConfig.SINGLE_BIN_PROTECTION
+        )
+        log_progress(f"STEP 4/6 complete in {format_time(time.time() - step_start)}")
+    else:
+        log_progress("STEP 4/6: Skipped (GroupNA=False)")
+    
+    # -------------------------------------------------------------------------
+    # Step 5: Optimize All (optional)
+    # -------------------------------------------------------------------------
+    if optimize_all:
+        step_start = time.time()
+        log_progress("STEP 5/6: Optimizing monotonicity for all variables...")
+        
+        # First combine NAs
+        bins_mod = na_combine(
+            bins_result, 
+            bins_result.var_summary['var'].tolist(),
+            prevent_single_bin=BinningConfig.SINGLE_BIN_PROTECTION
+        )
+        
+        # Force decreasing trend on variables with D trend
+        decr_vars = bins_mod.var_summary[bins_mod.var_summary['trend'] == 'D']['var'].tolist()
+        if decr_vars:
+            log_progress(f"  - Forcing decreasing trend on {len(decr_vars)} variables...")
+            bins_mod = force_decr_trend(bins_mod, decr_vars)
+        
+        # Force increasing trend on variables with I trend
+        incr_vars = bins_mod.var_summary[bins_mod.var_summary['trend'] == 'I']['var'].tolist()
+        if incr_vars:
+            log_progress(f"  - Forcing increasing trend on {len(incr_vars)} variables...")
+            bins_mod = force_incr_trend(bins_mod, incr_vars)
+        
+        bins_result = bins_mod
+        log_progress(f"STEP 5/6 complete in {format_time(time.time() - step_start)}")
+    else:
+        log_progress("STEP 5/6: Skipped (OptimizeAll=False)")
+    
+    # -------------------------------------------------------------------------
+    # Step 6: Apply WOE transformation
+    # -------------------------------------------------------------------------
+    step_start = time.time()
+    log_progress("STEP 6/6: Applying WOE transformation to data...")
+    
+    # Get final binning rules (exclude Total rows)
+    rules = bins_result.bin[bins_result.bin['bin'] != 'Total'].copy()
+    
+    # Calculate WOE for each bin
+    rules['woe'] = calculate_woe(rules['goods'].values, rules['bads'].values,
+                                use_shrinkage=BinningConfig.USE_SHRINKAGE,
+                                shrinkage_strength=BinningConfig.SHRINKAGE_STRENGTH)
+    
+    # Add bin value column for each variable
+    for var in bins_result.var_summary['var'].tolist():
+        var_mask = rules['var'] == var
+        rules.loc[var_mask, 'binValue'] = rules.loc[var_mask, 'bin'].apply(
+            lambda x: x.replace(var, '').replace(' %in% c', '').strip()
+        )
+    
+    # Apply binning to data
+    all_vars = bins_result.var_summary['var'].tolist()
+    log_progress(f"  - Creating binned columns for {len(all_vars)} variables...")
+    df_with_bins = create_binned_columns(bins_result, df, all_vars)
+    
+    log_progress(f"  - Adding WOE columns...")
+    df_with_woe = add_woe_columns(df_with_bins, rules, all_vars)
+    
+    # Create WOE-only DataFrame
+    woe_cols = [col for col in df_with_woe.columns if col.startswith('WOE_')]
+    df_only_woe = df_with_woe[woe_cols + [dv]].copy()
+    
+    bins = rules
+    
+    log_progress(f"STEP 6/6 complete in {format_time(time.time() - step_start)}")
+    
+    # -------------------------------------------------------------------------
+    # Diagnostics: Identify problematic variables
+    # -------------------------------------------------------------------------
+    log_progress("=" * 60)
+    log_progress("DIAGNOSTICS:")
+    
+    # Variables with single bin (WOE will always be 0)
+    single_bin_vars = []
+    for var in all_vars:
+        var_bins = bins[bins['var'] == var]
+        if len(var_bins) <= 1:
+            single_bin_vars.append(var)
+    
+    if single_bin_vars:
+        log_progress(f"  [WARN] {len(single_bin_vars)} variables have SINGLE BIN (WOE=0):")
+        if len(single_bin_vars) <= 20:
+            for v in single_bin_vars[:20]:
+                null_rate = df[v].isna().mean() * 100
+                log_progress(f"    - {v} (null rate: {null_rate:.1f}%)")
+        else:
+            log_progress(f"    First 10: {single_bin_vars[:10]}")
+            log_progress(f"    ... and {len(single_bin_vars) - 10} more")
+    
+    # Variables with all WOE=0
+    zero_woe_vars = []
+    for var in all_vars:
+        var_bins = bins[bins['var'] == var]
+        if 'woe' in var_bins.columns and (var_bins['woe'].abs() < 0.0001).all():
+            if var not in single_bin_vars:
+                zero_woe_vars.append(var)
+    
+    if zero_woe_vars:
+        log_progress(f"  [WARN] {len(zero_woe_vars)} additional variables have ALL WOE ≈ 0:")
+        if len(zero_woe_vars) <= 10:
+            log_progress(f"    {zero_woe_vars}")
+        else:
+            log_progress(f"    First 10: {zero_woe_vars[:10]}")
+    
+    # Variables with very low IV (< 0.02)
+    low_iv_count = (bins_result.var_summary['iv'] < 0.02).sum()
+    if low_iv_count > 0:
+        log_progress(f"  [INFO] {low_iv_count} variables have IV < 0.02 (weak predictive power)")
+    
+    # High null rate variables
+    high_null_vars = []
+    for var in all_vars:
+        null_rate = df[var].isna().mean()
+        if null_rate > 0.80:
+            high_null_vars.append((var, null_rate))
+    
+    if high_null_vars:
+        log_progress(f"  [INFO] {len(high_null_vars)} variables have >80% null values")
+        if len(high_null_vars) <= 10:
+            for v, nr in high_null_vars[:10]:
+                log_progress(f"    - {v}: {nr:.1%} null")
+    
+    # Summary stats
+    log_progress("=" * 60)
+    mono_count = bins_result.var_summary['monTrend'].value_counts().get('Y', 0)
+    log_progress(f"COMPLETE: Processed {len(all_vars)} variables")
+    log_progress(f"Monotonic variables: {mono_count}/{len(all_vars)} ({100*mono_count/len(all_vars):.1f}%)")
+    if single_bin_vars or zero_woe_vars:
+        log_progress(f"[!] Potential issues: {len(single_bin_vars)} single-bin, {len(zero_woe_vars)} zero-WOE vars")
+        log_progress(f"    Suggestions: Try lower MinBinPct (e.g., 0.01) or MinBinCount (e.g., 20)")
+    log_progress("=" * 60)
+
+else:
+    # =========================================================================
+    # INTERACTIVE MODE
+    # =========================================================================
+    # User-driven binning with Shiny web UI
+    
+    print("Running in interactive mode - launching Shiny UI...")
+    print("Algorithm: ChiMerge + Monotonic Optimization (Advanced)")
+    
+    # Run the interactive editor
+    results = run_woe_editor(df, min_prop=min_prop)
+    
+    if results['completed']:
+        # User clicked "Run & Close" - extract results
+        df_with_woe = results['df_with_woe']
+        df_only_woe = results['df_only_woe']
+        bins = results['bins']
+        dv = results['dv']
+        print("Interactive session completed successfully")
+    else:
+        # User closed the window without completing
+        print("Interactive session cancelled - returning empty results")
+        df_with_woe = df.copy()
+        df_only_woe = pd.DataFrame()
+        bins = pd.DataFrame()
+
+# =============================================================================
+# Output Tables
+# =============================================================================
+# This section creates the output tables for the KNIME node.
+# The node has 5 output ports, each serving a specific purpose.
+
+# Output 1: Original input DataFrame (unchanged)
+# Pass-through of original data for reference and downstream comparison
+knio.output_tables[0] = knio.Table.from_pandas(df)
+
+# Output 2: df_with_woe - Original data + binned columns + WOE columns
+# This is the most complete output, containing:
+# - All original columns
+# - b_* columns: binned values (categorical labels for each variable)
+# - WOE_* columns: Weight of Evidence values for each variable
+knio.output_tables[1] = knio.Table.from_pandas(df_with_woe)
+
+# Output 3: df_only_woe - Only WOE columns + dependent variable
+# This lean output is perfect for logistic regression:
+# - Contains only WOE_* columns (the transformed predictors)
+# - Plus the dependent variable for modeling
+knio.output_tables[2] = knio.Table.from_pandas(df_only_woe)
+
+# Output 4: df_only_bins - ONLY binned columns (b_*) for scorecard scoring
+# Extract only b_* columns from df_with_woe for lean scorecard input
+# This is used when applying the scorecard to new data
+b_columns = [col for col in df_with_woe.columns if col.startswith('b_')]
+df_only_bins = df_with_woe[b_columns].copy()
+knio.output_tables[3] = knio.Table.from_pandas(df_only_bins)
+
+# Output 5: bins - Binning rules with WOE values (metadata)
+# This contains the binning definitions that can be:
+# - Applied to new data using the Scorecard Apply node
+# - Used for documentation and model validation
+# - Exported for use in production systems
+knio.output_tables[4] = knio.Table.from_pandas(bins)
+
+# Log output summary
+log_progress("=" * 60)
+log_progress(f"OUTPUT SUMMARY:")
+log_progress(f"  Port 1: Original data ({len(df)} rows, {len(df.columns)} cols)")
+log_progress(f"  Port 2: With WOE ({len(df_with_woe)} rows, {len(df_with_woe.columns)} cols)")
+log_progress(f"  Port 3: Only WOE ({len(df_only_woe)} rows, {len(df_only_woe.columns)} cols)")
+log_progress(f"  Port 4: Only Bins ({len(df_only_bins)} rows, {len(df_only_bins.columns)} cols) ** USE FOR SCORECARD **")
+log_progress(f"  Port 5: Bin Rules ({len(bins)} rows - metadata)")
+log_progress("=" * 60)
+
+# Final success message
+print("WOE Editor (Advanced) completed successfully")
