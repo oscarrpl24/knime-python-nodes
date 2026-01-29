@@ -3,423 +3,461 @@
 # =============================================================================
 # 
 # PURPOSE:
-# This script performs "Reject Inference" - a credit risk modeling technique used
-# to estimate the likely outcomes (default or non-default) for loan applications
-# that were REJECTED and therefore have no actual performance data.
+# This script implements "reject inference" for credit risk modeling.
+# In credit scoring, we only observe outcomes (default/no default) for
+# applications that were APPROVED. Rejected applications never get loans,
+# so we never see their actual outcomes. This creates a biased sample.
 #
-# In credit risk modeling, we have two populations:
-#   1. APPROVED applications - these have actual outcomes (did they default or not?)
-#   2. REJECTED applications - these have no outcomes (we never gave them a loan)
+# Reject inference addresses this by:
+# 1. Using actual outcomes for approved applications (those with a LoanID)
+# 2. Probabilistically assigning outcomes to rejected applications based
+#    on their predicted default probability (expected_DefaultRate2)
 #
-# Reject Inference attempts to infer what would have happened if we HAD approved
-# the rejected applications, using probability scores from a model.
+# This script also imputes missing values for performance metrics (FRODI26,
+# GRODI26) using group averages based on the inferred default status.
 #
-# COMPATIBILITY:
+# COMPATIBLE WITH:
 # - KNIME Version: 5.9
 # - Python Version: 3.9.23
-# - Platform: Windows
 #
-# REQUIRED INPUT COLUMNS:
-# - LoanID: Identifier for the loan (missing/empty means rejected application)
-# - IsFPD: "Is First Payment Default" - actual default flag for approved loans
-# - FPD: Alternative default flag column
-# - expected_DefaultRate2: Model-predicted probability of default
-# - FRODI26: Some fraud/risk indicator metric
-# - GRODI26: Another fraud/risk indicator metric
+# INPUT:
+# - Table with columns: LoanID, IsFPD, FPD, expected_DefaultRate2, FRODI26, GRODI26
 #
-# OUTPUT COLUMNS CREATED:
-# - isFPD_wRI: Default flag "with Reject Inference" applied
-# - FRODI26_wRI: FRODI26 "with Reject Inference" applied  
-# - GRODI26_wRI: GRODI26 "with Reject Inference" applied
+# OUTPUT:
+# - Same table with three new columns: isFPD_wRI, FRODI26_wRI, GRODI26_wRI
+#
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # SECTION 1: IMPORT REQUIRED LIBRARIES
 # -----------------------------------------------------------------------------
 
-# Import the KNIME scripting interface - this is the bridge between Python and KNIME.
-# The 'knio' module provides access to input/output tables and flow variables.
-# This is a KNIME-specific module that only works inside KNIME Python Script nodes.
+# Import the KNIME scripting interface
+# This module provides access to KNIME's input/output tables and flow variables
+# It is the bridge between the Python script and the KNIME workflow
 import knime.scripting.io as knio
 
-# Import pandas - the primary data manipulation library in Python.
-# Pandas provides DataFrame objects (similar to Excel spreadsheets or SQL tables)
-# that make it easy to work with tabular data.
+# Import pandas for data manipulation
+# pandas is the primary library for working with tabular data in Python
+# It provides DataFrame objects (similar to Excel spreadsheets or SQL tables)
 import pandas as pd
 
-# Import numpy - the fundamental package for numerical computing in Python.
-# NumPy provides fast array operations and mathematical functions.
-# Here we use it specifically for generating random numbers.
+# Import numpy for numerical operations
+# numpy provides efficient array operations and random number generation
+# We use it here specifically for generating random values for reject inference
 import numpy as np
 
 # -----------------------------------------------------------------------------
-# SECTION 2: READ INPUT DATA FROM KNIME
+# SECTION 2: LOAD INPUT DATA
 # -----------------------------------------------------------------------------
 
-# Read the first input table (index 0) from KNIME and convert it to a pandas DataFrame.
-# In KNIME, input_tables is a list of all tables connected to the node's input ports.
-# The [0] gets the first (and in this case, only) input table.
-# The .to_pandas() method converts it from KNIME's internal format to a pandas DataFrame.
-# After this line, 'df' contains all the data we'll be working with.
+# Read the first input table from KNIME and convert it to a pandas DataFrame
+# knio.input_tables is a list of all input ports connected to this Python node
+# [0] accesses the first (and in this case, only) input port
+# .to_pandas() converts the KNIME table format into a pandas DataFrame
+# The DataFrame 'df' now contains all rows and columns from the input table
 df = knio.input_tables[0].to_pandas()
 
 # -----------------------------------------------------------------------------
-# SECTION 3: DEFINE HELPER FUNCTION FOR MISSING VALUE DETECTION
+# SECTION 3: HELPER FUNCTION FOR MISSING VALUE DETECTION
 # -----------------------------------------------------------------------------
 
-# Define a helper function to check if a value should be considered "missing".
-# This is important because missing values can come in many forms:
-#   - pandas NA (pd.NA)
-#   - numpy NaN (np.nan)
-#   - Python None
-#   - Empty strings ("")
-#   - Strings with only whitespace ("   ")
+# Define a helper function to check if a value is null, empty, or missing
+# This function handles multiple ways data can be "missing":
+#   - Standard Python/pandas null values (None, NaN, pd.NA)
+#   - Empty strings or strings containing only whitespace
 #
-# This function returns True if the value is any kind of missing, False otherwise.
+# Parameters:
+#   value: Any value to check for missingness
+#
+# Returns:
+#   True if the value is considered missing, False otherwise
 def is_missing(value):
     
-    # First, check if the value is a pandas/numpy null value.
-    # pd.isna() returns True for: None, pd.NA, np.nan, and pd.NaT (datetime null).
-    # This handles the standard "null" cases that pandas recognizes.
+    # First check: Use pandas' isna() function to detect standard null values
+    # This catches None, NaN, pd.NA, and numpy's nan values
+    # pd.isna() is the recommended way to check for null values in pandas
     if pd.isna(value):
+        # If pandas recognizes this as a null value, return True (it IS missing)
         return True
     
-    # Second, check if the value is a string that is effectively empty.
-    # isinstance(value, str) checks if the value is a text string.
-    # value.strip() removes all leading and trailing whitespace from the string.
-    # If after stripping whitespace the string is empty (''), it's considered missing.
-    # This catches cases like "", "   ", "\t\n", etc.
+    # Second check: Handle empty strings
+    # Sometimes data comes with empty strings "" instead of true null values
+    # We need to check if the value is a string first (using isinstance)
+    # Then we strip whitespace and check if anything remains
     if isinstance(value, str) and value.strip() == '':
+        # The value is a string that contains only whitespace (or nothing)
+        # We consider this as missing, so return True
         return True
     
-    # If neither condition was met, the value is NOT missing.
-    # Return False to indicate this value contains actual data.
+    # If neither check triggered, the value is NOT missing
+    # Return False to indicate this is a valid, non-missing value
     return False
 
 # -----------------------------------------------------------------------------
-# SECTION 4: CREATE MASKS FOR LOANID PRESENCE
+# SECTION 4: CREATE LOAN ID PRESENCE MASKS
 # -----------------------------------------------------------------------------
 
-# A "mask" in pandas is a boolean Series (column) where each row is True or False.
-# Masks are used to filter or select specific rows of a DataFrame.
-
-# Create a mask indicating which rows have a valid (non-missing) LoanID.
-# The .apply() method runs our is_missing() function on every value in the 'LoanID' column.
-# The 'lambda x' creates an anonymous function that takes each value (x) and returns
-# 'not is_missing(x)' - so True if the LoanID is present, False if it's missing.
-# Result: loan_id_present[i] is True if row i has a valid LoanID.
+# Create a boolean mask (Series of True/False values) indicating where LoanID is present
+# 
+# We iterate over each value in the 'LoanID' column using .apply()
+# For each value, we call is_missing() to check if it's null/empty
+# The lambda function returns True if the value is NOT missing (note the 'not')
+# 
+# Result: A pandas Series where:
+#   - True means this row HAS a valid LoanID (approved application with a loan)
+#   - False means this row does NOT have a LoanID (rejected application)
 loan_id_present = df['LoanID'].apply(lambda x: not is_missing(x))
 
-# Create the inverse mask - True where LoanID is missing.
-# The ~ operator in pandas/numpy is the logical NOT operator.
-# This flips all True values to False and all False values to True.
-# Result: loan_id_missing[i] is True if row i has a missing LoanID (rejected application).
+# Create the inverse mask for convenience
+# The tilde (~) operator flips all True values to False and vice versa
+# 
+# Result: A pandas Series where:
+#   - True means this row does NOT have a LoanID (rejected application)
+#   - False means this row HAS a LoanID (approved application)
 loan_id_missing = ~loan_id_present
 
 # -----------------------------------------------------------------------------
-# SECTION 5: INITIALIZE THE NEW DEFAULT FLAG COLUMN (isFPD_wRI)
+# SECTION 5: INITIALIZE THE NEW isFPD_wRI COLUMN
 # -----------------------------------------------------------------------------
 
-# Create a new column called 'isFPD_wRI' (IsFPD with Reject Inference).
-# This column will eventually contain:
-#   - For approved loans (LoanID present): the actual default status
-#   - For rejected loans (LoanID missing): an inferred default status
-
-# Initialize the column with all missing values (pd.NA).
-# pd.array() creates a pandas array with specific values.
-# [pd.NA] * len(df) creates a list of pd.NA values, one for each row in the DataFrame.
-# dtype='Int32' specifies this is a nullable integer column.
-# IMPORTANT: We use 'Int32' (capital I) not 'int32' (lowercase i) because:
-#   - 'Int32' is a nullable integer type that can hold missing values (pd.NA)
-#   - 'int32' is a regular integer that CANNOT hold missing values (would fail)
-# KNIME requires nullable types when columns might contain missing values.
+# Create a new column called 'isFPD_wRI' (is First Payment Default with Reject Inference)
+# 
+# We initialize it with all missing values (pd.NA) for now
+# We'll fill in the values in the following steps
+#
+# IMPORTANT: We use 'Int32' (capital I) instead of 'int32' (lowercase i)
+# The capital I version is pandas' nullable integer type
+# Regular Python integers cannot represent missing values (they must have a number)
+# The nullable Int32 type CAN hold missing values (pd.NA), which we need here
+# because some rows might not have a value after all our logic runs
+#
+# We create an array of pd.NA values with the same length as our DataFrame
+# pd.array() creates a pandas array with the specified dtype
 df['isFPD_wRI'] = pd.array([pd.NA] * len(df), dtype='Int32')
 
 # -----------------------------------------------------------------------------
-# SECTION 6: STEP 1 - APPROVED LOANS: COPY ACTUAL DEFAULT STATUS
+# SECTION 6: STEP 1 - ASSIGN VALUES FOR APPROVED APPLICATIONS
 # -----------------------------------------------------------------------------
 
-# For approved loans (where LoanID is present), we use the actual default status.
-# These loans have real outcomes - we know if they actually defaulted or not.
-
-# df.loc[mask, column] is pandas' way of selecting specific rows and columns.
-# - loan_id_present is our True/False mask saying which rows to select
-# - 'isFPD_wRI' is the column we want to modify (left side of =)
-# - df.loc[loan_id_present, 'IsFPD'] gets the IsFPD values for those same rows
-
-# This line says: "For all rows where LoanID is present, set isFPD_wRI equal to IsFPD"
-# Essentially copying the actual default flag for approved loans.
+# Step 1: For approved applications (those with a LoanID), use the actual IsFPD value
+#
+# When a loan was actually issued (LoanID is present), we have the real outcome
+# IsFPD = 1 means the customer defaulted on their first payment (bad)
+# IsFPD = 0 means the customer made their first payment successfully (good)
+#
+# .loc[] is pandas' label-based indexer for selecting rows and columns
+# The first part (loan_id_present) selects which ROWS to modify
+# The second part ('isFPD_wRI') specifies which COLUMN to modify
+# We copy the actual outcome from the 'IsFPD' column
 df.loc[loan_id_present, 'isFPD_wRI'] = df.loc[loan_id_present, 'IsFPD']
 
 # -----------------------------------------------------------------------------
-# SECTION 7: STEP 2 - REJECTED LOANS: TRY USING FPD COLUMN FIRST
+# SECTION 7: STEP 2 - ASSIGN VALUES FROM FPD FOR REJECTED APPLICATIONS
 # -----------------------------------------------------------------------------
 
-# For rejected loans (where LoanID is missing), first try to use the FPD column.
-# The FPD column might have pre-populated values for some rejected applications.
-# This could be from previous reject inference runs or external data sources.
-
-# This line says: "For all rows where LoanID is missing, set isFPD_wRI equal to FPD"
-# If FPD is also missing for a row, isFPD_wRI will remain missing (we handle that next).
+# Step 2: For rejected applications (no LoanID), try to use the FPD column
+#
+# The FPD column might contain pre-assigned values for some rejected applications
+# This could come from a previous reject inference step or external data
+# If FPD has a value, we use it; if not, we'll handle it in Step 3
+#
+# We only modify rows where LoanID is missing (rejected applications)
+# We copy whatever value exists in the 'FPD' column (could be a number or null)
 df.loc[loan_id_missing, 'isFPD_wRI'] = df.loc[loan_id_missing, 'FPD']
 
 # -----------------------------------------------------------------------------
-# SECTION 8: STEP 3 - REJECTED LOANS: PROBABILISTIC INFERENCE FOR REMAINING
+# SECTION 8: STEP 3 - PROBABILISTIC INFERENCE FOR REMAINING MISSING VALUES
 # -----------------------------------------------------------------------------
 
-# Some rejected loans might still have missing isFPD_wRI values after Step 2.
-# This happens when both LoanID is missing AND FPD is missing.
-# For these cases, we'll use probabilistic reject inference based on model scores.
+# Step 3: Handle remaining missing values using probabilistic assignment
+#
+# After Steps 1 and 2, some rows might still have missing isFPD_wRI values
+# These are rejected applications where FPD was also null
+# For these, we use the predicted default probability to randomly assign outcomes
 
-# Create a mask for rows that STILL need values after Steps 1 and 2.
-# loan_id_missing: True for rejected applications (LoanID is missing)
-# df['isFPD_wRI'].isna(): True for rows where isFPD_wRI is still missing/null
-# The & operator combines both conditions - both must be True.
-# Result: still_missing_mask is True only for rejected loans that still need inference.
+# Create a mask for rows that STILL have missing isFPD_wRI values
+# AND are rejected applications (LoanID is missing)
+# We combine two conditions:
+#   1. loan_id_missing: The application was rejected (no loan was issued)
+#   2. df['isFPD_wRI'].isna(): The isFPD_wRI value is still null after Steps 1 & 2
+# The & operator combines these with AND logic
 still_missing_mask = loan_id_missing & df['isFPD_wRI'].isna()
 
-# Create a mask for rows that have an expected default rate (probability score).
-# .notna() returns True if the value is NOT null/missing.
-# We can only do probabilistic inference if we have a probability to use.
+# Check which rows have a valid expected_DefaultRate2 value
+# expected_DefaultRate2 is the model's predicted probability of default
+# We can only do probabilistic inference if we have this probability
+# .notna() returns True for non-null values, False for null values
 has_expected_rate = df['expected_DefaultRate2'].notna()
 
-# Combine both masks: we only process rows that:
-#   1. Still need a value (still_missing_mask = True)
-#   2. Have an expected default rate to base our inference on (has_expected_rate = True)
-# The & operator requires BOTH conditions to be True.
+# Combine the masks to find rows that need probabilistic inference
+# These rows must satisfy ALL of these conditions:
+#   1. Rejected application (no LoanID)
+#   2. isFPD_wRI is still missing (FPD didn't provide a value)
+#   3. We have a predicted default rate to use for inference
 rows_to_process = still_missing_mask & has_expected_rate
 
-# Check if there are ANY rows that need probabilistic inference.
-# .any() returns True if at least one value in the mask is True.
-# If no rows need processing, we skip this entire block to save computation.
+# Only proceed if there are actually rows to process
+# .any() returns True if at least one value in the Series is True
+# This avoids unnecessary computation if all values are already filled
 if rows_to_process.any():
     
-    # Count how many rows need probabilistic inference.
-    # .sum() on a boolean mask counts the True values (True=1, False=0).
-    # We need this number to generate the right amount of random values.
+    # Count how many rows need probabilistic assignment
+    # .sum() counts True values (since True=1 and False=0 in Python)
     num_rows = rows_to_process.sum()
     
-    # Generate random numbers for each row that needs inference.
-    # np.random.random(n) generates n random floats uniformly distributed between 0 and 1.
-    # Each value is independent and equally likely to be anywhere in [0, 1).
-    # Example: if num_rows=5, might get [0.23, 0.87, 0.12, 0.56, 0.91]
+    # Generate random numbers between 0 and 1 for each row that needs assignment
+    # np.random.random(n) generates n random floats uniformly distributed in [0, 1)
+    # Each row gets its own random number to determine its outcome
     random_values = np.random.random(num_rows)
     
-    # Get the model-predicted default probabilities for the rows we're processing.
-    # df.loc[mask, column] selects specific rows from a column.
-    # .values converts the pandas Series to a numpy array (faster for comparison).
-    # These are the probabilities that each rejected applicant would have defaulted.
-    # Example: [0.15, 0.45, 0.08, 0.72, 0.33] means 15%, 45%, 8%, 72%, 33% default prob.
+    # Get the expected default rates for the rows we're processing
+    # .loc[rows_to_process, 'expected_DefaultRate2'] selects only the relevant rows
+    # .values converts the pandas Series to a numpy array for faster comparison
+    # These probabilities typically range from 0.0 (very unlikely to default) 
+    # to 1.0 (very likely to default)
     expected_rates = df.loc[rows_to_process, 'expected_DefaultRate2'].values
     
-    # CORE REJECT INFERENCE LOGIC:
-    # We assign a simulated default (1) or non-default (0) based on probability.
+    # Perform the probabilistic assignment using Monte Carlo simulation
     # 
-    # The logic: If random_value <= expected_default_rate, assign 1 (default), else 0.
-    # 
-    # Why this works:
-    # - If expected_rate = 0.30 (30% default probability)
-    # - random_value is uniformly distributed from 0 to 1
-    # - There's a 30% chance random_value will be <= 0.30
-    # - So 30% of such cases will be assigned "default" (1)
-    # - This matches the expected default rate!
+    # For each row, we compare its random value to its expected default rate:
+    #   - If random <= expected_rate: assign 1 (default)
+    #   - If random > expected_rate: assign 0 (no default)
     #
-    # (random_values <= expected_rates) produces a boolean array: [True, False, True, ...]
-    # .astype(int) converts booleans to integers: True->1, False->0
-    # Result: array of 0s and 1s representing inferred default status.
+    # Example: If expected_DefaultRate2 = 0.3 (30% chance of default)
+    #   - Random values 0.0 to 0.3 will result in default (1)
+    #   - Random values 0.3 to 1.0 will result in no default (0)
+    #   - This gives approximately 30% of such cases a default outcome
+    #
+    # The comparison (random_values <= expected_rates) returns boolean array
+    # .astype(int) converts True to 1 and False to 0
     assigned_values = (random_values <= expected_rates).astype(int)
     
-    # Assign the inferred default values back to the DataFrame.
-    # Only the rows matching rows_to_process mask will be updated.
-    # Other rows remain unchanged (either have actual values or stay missing).
+    # Assign the probabilistically determined values to the isFPD_wRI column
+    # Only the rows identified by rows_to_process are modified
     df.loc[rows_to_process, 'isFPD_wRI'] = assigned_values
 
 # -----------------------------------------------------------------------------
-# SECTION 9: ENSURE PROPER DATA TYPE FOR isFPD_wRI
+# SECTION 9: ENSURE CORRECT DATA TYPE FOR isFPD_wRI
 # -----------------------------------------------------------------------------
 
-# Ensure the column has the correct nullable integer type for KNIME.
-# Even though we initialized it as Int32, operations might have changed it.
-# This explicit cast ensures KNIME will receive the expected data type.
-# 'Int32' (capital I) is pandas' nullable integer type that:
-#   - Can store integer values: 0, 1, 2, etc.
-#   - Can store missing values: pd.NA
-#   - Maps correctly to KNIME's integer column type
+# Ensure the isFPD_wRI column is stored as nullable Int32
+# 
+# This step is a safety measure because the assignments above might have
+# changed the column's dtype to something else (like float64)
+# 
+# Int32 (capital I) is pandas' nullable integer type, which:
+#   - Stores integers (0, 1, 2, etc.)
+#   - Can also store missing values (pd.NA)
+#   - Is compatible with KNIME's integer column type
 df['isFPD_wRI'] = df['isFPD_wRI'].astype('Int32')
 
 # =============================================================================
 # SECTION 10: FRODI26_wRI AND GRODI26_wRI COLUMN GENERATION
 # =============================================================================
-# 
-# Next, we create "with Reject Inference" versions of two fraud/risk metrics.
-# The logic:
-#   - If the original value exists, keep it
-#   - If the original value is missing, impute it with the average value
-#     from approved loans with the same inferred default status
 #
-# Why? Rejected applications don't have these metrics (they were never approved).
-# We estimate them by using averages from similar approved applications.
+# This section creates imputed versions of the FRODI26 and GRODI26 columns
+# 
+# FRODI26 and GRODI26 are performance metrics (likely related to income or payments)
+# For approved applications, we have actual values
+# For rejected applications, these values are missing (we never issued a loan)
+#
+# We impute (fill in) missing values using the AVERAGE of similar applications
+# "Similar" is defined by their default status (IsFPD = 0 or 1)
+# This is called "hot deck imputation" or "mean imputation by group"
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# SECTION 11: CALCULATE AVERAGE FRODI26 AND GRODI26 BY DEFAULT STATUS
+# SECTION 11: CALCULATE GROUP AVERAGES FOR IMPUTATION
 # -----------------------------------------------------------------------------
 
-# Calculate the average FRODI26 value for loans that DID default (IsFPD = 1).
-# We use the ORIGINAL IsFPD column (not isFPD_wRI) because we want averages
-# based on ACTUAL outcomes, not inferred ones.
-# df.loc[condition, column] selects rows matching condition from that column.
-# .mean() calculates the arithmetic average of all selected values (ignores NaN).
+# Calculate the average FRODI26 value for applications that DID default (IsFPD = 1)
+# 
+# df['IsFPD'] == 1 creates a boolean mask selecting only defaulted applications
+# df.loc[mask, 'FRODI26'] selects the FRODI26 values for those applications
+# .mean() calculates the arithmetic mean of those values
+# 
+# This average will be used to impute FRODI26 for rejected applications
+# that we inferred as likely defaulters (isFPD_wRI = 1)
 avg_frodi26_fpd1 = df.loc[df['IsFPD'] == 1, 'FRODI26'].mean()
 
-# Calculate the average FRODI26 value for loans that did NOT default (IsFPD = 0).
-# This gives us the typical FRODI26 for non-defaulters.
+# Calculate the average FRODI26 value for applications that did NOT default (IsFPD = 0)
+# This will be used for rejected applications inferred as non-defaulters (isFPD_wRI = 0)
 avg_frodi26_fpd0 = df.loc[df['IsFPD'] == 0, 'FRODI26'].mean()
 
-# Calculate the average GRODI26 value for loans that DID default (IsFPD = 1).
+# Calculate the average GRODI26 value for defaulted applications (IsFPD = 1)
 avg_grodi26_fpd1 = df.loc[df['IsFPD'] == 1, 'GRODI26'].mean()
 
-# Calculate the average GRODI26 value for loans that did NOT default (IsFPD = 0).
+# Calculate the average GRODI26 value for non-defaulted applications (IsFPD = 0)
 avg_grodi26_fpd0 = df.loc[df['IsFPD'] == 0, 'GRODI26'].mean()
 
 # -----------------------------------------------------------------------------
 # SECTION 12: CREATE FRODI26_wRI COLUMN
 # -----------------------------------------------------------------------------
 
-# Create a mask indicating which rows have a missing FRODI26 value.
-# We reuse our is_missing() function to catch all forms of missing values.
-# .apply() runs the function on every value in the FRODI26 column.
+# Create a boolean mask identifying rows where FRODI26 is missing
+# We use our is_missing() helper function to check each value
+# .apply() runs the function on every value in the column
 frodi26_missing = df['FRODI26'].apply(is_missing)
 
-# Create the inverse mask - True where FRODI26 is present (has a valid value).
+# Create the inverse mask for rows where FRODI26 is present (has a valid value)
+# The tilde (~) operator flips True to False and vice versa
 frodi26_present = ~frodi26_missing
 
-# Initialize the new column with all missing values.
-# We'll fill in values in the next steps.
+# Initialize the new FRODI26_wRI column with all missing values
+# We'll fill it in step by step
 df['FRODI26_wRI'] = pd.NA
 
-# For rows where FRODI26 already has a value, copy it directly to FRODI26_wRI.
-# These are typically approved loans that have actual data.
-# We preserve existing data rather than overwriting it with averages.
+# For rows where FRODI26 already has a value, copy that value to FRODI26_wRI
+# These are typically approved applications where we have actual performance data
 df.loc[frodi26_present, 'FRODI26_wRI'] = df.loc[frodi26_present, 'FRODI26']
 
-# For rows where FRODI26 is missing AND the inferred default status is 1 (defaulter),
-# fill in the average FRODI26 from actual defaulters.
-# This uses both conditions combined with & (AND operator).
-# frodi26_missing: True where FRODI26 needs imputation
-# df['isFPD_wRI'] == 1: True where inferred default status is "did default"
+# For rows where FRODI26 is missing AND isFPD_wRI is 1 (defaulter):
+# Use the average FRODI26 of actual defaulters as the imputed value
+# This assumes rejected applications that are inferred as defaulters
+# would have similar FRODI26 values to actual defaulters
 df.loc[frodi26_missing & (df['isFPD_wRI'] == 1), 'FRODI26_wRI'] = avg_frodi26_fpd1
 
-# For rows where FRODI26 is missing AND the inferred default status is 0 (non-defaulter),
-# fill in the average FRODI26 from actual non-defaulters.
+# For rows where FRODI26 is missing AND isFPD_wRI is 0 (non-defaulter):
+# Use the average FRODI26 of actual non-defaulters as the imputed value
 df.loc[frodi26_missing & (df['isFPD_wRI'] == 0), 'FRODI26_wRI'] = avg_frodi26_fpd0
 
-# Convert the column to nullable float type for KNIME compatibility.
-# 'Float64' (capital F) is pandas' nullable float type that:
-#   - Can store decimal numbers: 0.5, 1.23, etc.
-#   - Can store missing values: pd.NA
-#   - Maps correctly to KNIME's double column type
+# Convert FRODI26_wRI to nullable Float64 type
+# 
+# Float64 (capital F) is pandas' nullable floating-point type
+# We use this because FRODI26 values are likely decimals/fractions
+# The capital F version can store missing values (pd.NA), unlike regular float64
 df['FRODI26_wRI'] = df['FRODI26_wRI'].astype('Float64')
 
 # -----------------------------------------------------------------------------
 # SECTION 13: CREATE GRODI26_wRI COLUMN
 # -----------------------------------------------------------------------------
 
-# Create a mask indicating which rows have a missing GRODI26 value.
-# Same logic as FRODI26 - we check for all forms of missing.
+# Create a boolean mask identifying rows where GRODI26 is missing
+# Same logic as FRODI26 above
 grodi26_missing = df['GRODI26'].apply(is_missing)
 
-# Create the inverse mask - True where GRODI26 has a valid value.
+# Create the inverse mask for rows where GRODI26 is present
 grodi26_present = ~grodi26_missing
 
-# Initialize the new column with all missing values.
+# Initialize the new GRODI26_wRI column with all missing values
 df['GRODI26_wRI'] = pd.NA
 
-# For rows where GRODI26 already has a value, copy it directly to GRODI26_wRI.
-# Preserves actual data from approved loans.
+# Copy existing GRODI26 values to GRODI26_wRI where available
+# These are approved applications with actual performance data
 df.loc[grodi26_present, 'GRODI26_wRI'] = df.loc[grodi26_present, 'GRODI26']
 
-# For rows where GRODI26 is missing AND inferred as defaulter (isFPD_wRI = 1),
-# fill with average GRODI26 from actual defaulters.
+# Impute missing values for inferred defaulters (isFPD_wRI = 1)
+# Use the average GRODI26 of actual defaulters
 df.loc[grodi26_missing & (df['isFPD_wRI'] == 1), 'GRODI26_wRI'] = avg_grodi26_fpd1
 
-# For rows where GRODI26 is missing AND inferred as non-defaulter (isFPD_wRI = 0),
-# fill with average GRODI26 from actual non-defaulters.
+# Impute missing values for inferred non-defaulters (isFPD_wRI = 0)
+# Use the average GRODI26 of actual non-defaulters
 df.loc[grodi26_missing & (df['isFPD_wRI'] == 0), 'GRODI26_wRI'] = avg_grodi26_fpd0
 
-# Convert the column to nullable float type for KNIME compatibility.
+# Convert GRODI26_wRI to nullable Float64 type for KNIME compatibility
 df['GRODI26_wRI'] = df['GRODI26_wRI'].astype('Float64')
 
 # =============================================================================
 # SECTION 14: REORDER COLUMNS FOR BETTER ORGANIZATION
 # =============================================================================
 #
-# We want to place each new "_wRI" column right after its source column.
-# This makes the output easier to read and understand:
-#   - isFPD_wRI appears right after IsFPD
-#   - FRODI26_wRI appears right after FRODI26
-#   - GRODI26_wRI appears right after GRODI26
+# This section reorganizes the DataFrame columns to place the new columns
+# immediately after their source columns for better readability
+#
+# Current state: New columns are at the end of the DataFrame
+# Desired state: Each _wRI column appears right after its source column
+#   - IsFPD followed by isFPD_wRI
+#   - FRODI26 followed by FRODI26_wRI
+#   - GRODI26 followed by GRODI26_wRI
 # =============================================================================
 
-# Get the current list of all column names in the DataFrame.
-# .columns returns an Index object with column names.
-# .tolist() converts it to a regular Python list that we can manipulate.
+# Get the current list of column names as a Python list
+# .columns returns a pandas Index object; .tolist() converts it to a regular list
+# We need a list because we'll be modifying the order
 cols = df.columns.tolist()
 
-# Remove the new columns from their current positions.
-# When we created them, they were added at the end of the DataFrame.
-# We'll re-insert them at the desired positions.
-# .remove() finds and removes the first occurrence of the item from the list.
-cols.remove('isFPD_wRI')      # Remove from current position (at the end)
-cols.remove('FRODI26_wRI')    # Remove from current position
-cols.remove('GRODI26_wRI')    # Remove from current position
+# -----------------------------------------------------------------------------
+# SECTION 15: REMOVE NEW COLUMNS FROM CURRENT POSITIONS
+# -----------------------------------------------------------------------------
 
-# Find the position of the 'IsFPD' column in our list.
-# .index() returns the position (0-based) of the first occurrence.
-# Example: if IsFPD is the 5th column, isfpd_index = 4 (0-based indexing)
+# Remove the new columns from wherever they currently are in the list
+# They were added at the end when we created them
+# We need to remove them first so we can insert them in the correct positions
+
+# Remove 'isFPD_wRI' from the column list
+# .remove() finds and removes the first occurrence of the specified value
+cols.remove('isFPD_wRI')
+
+# Remove 'FRODI26_wRI' from the column list
+cols.remove('FRODI26_wRI')
+
+# Remove 'GRODI26_wRI' from the column list
+cols.remove('GRODI26_wRI')
+
+# -----------------------------------------------------------------------------
+# SECTION 16: INSERT isFPD_wRI AFTER IsFPD
+# -----------------------------------------------------------------------------
+
+# Find the current position (index) of the 'IsFPD' column in the list
+# .index() returns the position of the first occurrence of the specified value
+# Python list indices are 0-based, so the first column is at index 0
 isfpd_index = cols.index('IsFPD')
 
-# Insert 'isFPD_wRI' right after 'IsFPD'.
-# .insert(position, item) adds the item at the specified position.
-# isfpd_index + 1 means "one position after IsFPD".
-# All subsequent items shift right to make room.
+# Insert 'isFPD_wRI' immediately after 'IsFPD'
+# .insert(position, value) inserts the value at the specified position
+# We use isfpd_index + 1 to place it right after IsFPD
+# All columns after this position are shifted right by one
 cols.insert(isfpd_index + 1, 'isFPD_wRI')
 
-# Find the position of 'FRODI26' column.
-# Note: positions may have shifted after the previous insert, but we're finding
-# the index fresh from the current state of the list.
+# -----------------------------------------------------------------------------
+# SECTION 17: INSERT FRODI26_wRI AFTER FRODI26
+# -----------------------------------------------------------------------------
+
+# Find the current position of the 'FRODI26' column
+# Note: The position might have shifted after we inserted isFPD_wRI above
+# But since FRODI26 is likely AFTER IsFPD, the shift doesn't affect its relative position
 frodi26_index = cols.index('FRODI26')
 
-# Insert 'FRODI26_wRI' right after 'FRODI26'.
+# Insert 'FRODI26_wRI' immediately after 'FRODI26'
 cols.insert(frodi26_index + 1, 'FRODI26_wRI')
 
-# Find the position of 'GRODI26' column.
-# Note: The list has changed since we inserted FRODI26_wRI, so positions
-# of columns after FRODI26 have shifted. This is accounted for automatically
-# by finding the index fresh.
+# -----------------------------------------------------------------------------
+# SECTION 18: INSERT GRODI26_wRI AFTER GRODI26
+# -----------------------------------------------------------------------------
+
+# Find the current position of the 'GRODI26' column
+# The position accounts for the previous insertions of isFPD_wRI and FRODI26_wRI
 grodi26_index = cols.index('GRODI26')
 
-# Insert 'GRODI26_wRI' right after 'GRODI26'.
+# Insert 'GRODI26_wRI' immediately after 'GRODI26'
 cols.insert(grodi26_index + 1, 'GRODI26_wRI')
 
-# Reorder the DataFrame columns according to our new column order.
-# df[cols] creates a new DataFrame with columns in the order specified by 'cols'.
-# We assign it back to df to replace the original column order.
+# -----------------------------------------------------------------------------
+# SECTION 19: APPLY THE NEW COLUMN ORDER
+# -----------------------------------------------------------------------------
+
+# Reorder the DataFrame columns according to our new list
+# df[cols] creates a new DataFrame with columns in the order specified by 'cols'
+# We assign it back to 'df' to apply the reordering
 df = df[cols]
 
 # =============================================================================
-# SECTION 15: OUTPUT RESULTS TO KNIME
+# SECTION 20: OUTPUT THE RESULTS TO KNIME
 # =============================================================================
 
-# Send the final DataFrame back to KNIME through output port 0.
-# knio.output_tables[0] is the first (and only) output port of this node.
+# Write the processed DataFrame to the first (and only) output port
+# 
+# knio.output_tables is a list representing the output ports of this Python node
+# [0] accesses the first output port
+# 
 # knio.Table.from_pandas(df) converts our pandas DataFrame back to KNIME's
-# internal table format that can be passed to downstream nodes.
+# internal table format, which is required for passing data to downstream nodes
 # 
 # The output table contains:
 #   - All original columns from the input
 #   - Three new columns: isFPD_wRI, FRODI26_wRI, GRODI26_wRI
-#   - Columns reordered so new columns appear next to their source columns
+#   - Columns reordered so _wRI columns appear next to their source columns
 knio.output_tables[0] = knio.Table.from_pandas(df)
 
 # =============================================================================
@@ -428,27 +466,25 @@ knio.output_tables[0] = knio.Table.from_pandas(df)
 #
 # SUMMARY OF WHAT THIS SCRIPT DOES:
 #
-# 1. Reads a table containing loan application data with both approved and
-#    rejected applications (rejected identified by missing LoanID).
+# 1. READS input data containing loan applications (approved and rejected)
 #
-# 2. Creates isFPD_wRI (Is First Payment Default with Reject Inference):
-#    - For approved loans: uses actual default status (IsFPD)
-#    - For rejected loans: first tries FPD column, then uses probabilistic
-#      inference based on expected_DefaultRate2 (assigns 1 or 0 randomly
-#      with probability matching the expected default rate)
+# 2. CREATES isFPD_wRI (First Payment Default with Reject Inference):
+#    - For APPROVED applications (have LoanID): Uses actual IsFPD value
+#    - For REJECTED applications (no LoanID): 
+#      a. First tries to use the FPD column if available
+#      b. Otherwise, uses Monte Carlo simulation based on expected_DefaultRate2
+#         to probabilistically assign 0 or 1
 #
-# 3. Creates FRODI26_wRI and GRODI26_wRI:
-#    - Preserves original values where they exist
-#    - For missing values: imputes with the average from approved loans
-#      that have the same default status as the inferred status
+# 3. CREATES FRODI26_wRI and GRODI26_wRI:
+#    - For applications WITH existing values: Copies the original value
+#    - For applications WITHOUT values: Imputes using group averages
+#      based on the inferred default status (isFPD_wRI)
 #
-# 4. Reorders columns so new columns appear next to their source columns.
+# 4. REORDERS columns so new _wRI columns appear next to their source columns
 #
-# 5. Outputs the enhanced table to KNIME.
+# 5. OUTPUTS the enriched DataFrame to KNIME for downstream processing
 #
-# KEY CONCEPTS USED:
-# - Boolean masks for row selection
-# - Probabilistic assignment using random numbers
-# - Mean imputation stratified by outcome group
-# - Pandas nullable types (Int32, Float64) for KNIME compatibility
+# This reject inference approach helps address sample bias in credit scoring
+# models by including rejected applications in the analysis with statistically
+# inferred outcomes based on their predicted risk profiles.
 # =============================================================================
