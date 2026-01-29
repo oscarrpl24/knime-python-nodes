@@ -2639,3 +2639,778 @@ def add_ebm_importance_to_measures(
         df['EBM_Disagrees'] = df['Rank_Diff'] > 20  # Flag if ranks differ by more than 20
     
     return df
+
+
+# =============================================================================
+# SECTION 16: SHINY UI APPLICATION
+# =============================================================================
+# This section defines the interactive web-based user interface using Shiny.
+# The UI allows users to configure variable selection parameters, run analyses,
+# and view results before generating outputs.
+
+def create_variable_selection_app(
+    df: pd.DataFrame,
+    min_prop: float = 0.01
+):
+    """
+    Create the Variable Selection Shiny application.
+    
+    PURPOSE:
+    Builds and returns a Shiny app for interactive variable selection.
+    Users can select measures, configure criteria, run EBM, and submit results.
+    
+    PARAMETERS:
+    - df (pd.DataFrame): The input dataset with WOE columns
+    - min_prop (float): Minimum proportion per bin (default 1%)
+    
+    RETURNS:
+    App: Configured Shiny application object with results dictionary attached
+    """
+    
+    # Find binary target variable candidates
+    # Binary vars have exactly 2 unique values and don't start with WOE_ or b_
+    binary_vars = [col for col in df.columns
+                   if df[col].nunique() == 2 and not col.startswith(('WOE_', 'b_'))]
+    
+    # Get WOE columns (columns starting with WOE_)
+    woe_cols = [col for col in df.columns if col.startswith('WOE_')]
+    
+    # Dictionary to store results from the UI session
+    # This is modified by the server function and accessed after app closes
+    app_results = {
+        'measures': None,           # Calculated measures DataFrame
+        'selected_data': None,      # Selected data for output
+        'ebm_report': None,         # EBM interaction report
+        'correlation_matrix': None, # Correlation matrix
+        'vif_report': None,         # VIF report
+        'removed_for_vif': [],      # Variables removed for high VIF
+        'completed': False          # Flag indicating successful submission
+    }
+    
+    # ==========================================================================
+    # UI DEFINITION
+    # ==========================================================================
+    # The UI is defined using Shiny's page_fluid layout with custom CSS styling
+    
+    app_ui = ui.page_fluid(
+        # Custom CSS for dark theme with gradient background
+        ui.tags.head(
+            ui.tags.style("""
+                @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap');
+                body { 
+                    font-family: 'Space Grotesk', sans-serif; 
+                    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                    color: #eee;
+                    min-height: 100vh;
+                }
+                .card { 
+                    background: rgba(255,255,255,0.05); 
+                    border-radius: 12px; 
+                    padding: 20px; 
+                    margin: 10px 0; 
+                    border: 1px solid rgba(255,255,255,0.1);
+                    backdrop-filter: blur(10px);
+                }
+                .btn-primary { background: linear-gradient(45deg, #667eea, #764ba2); border: none; }
+                .btn-success { background: linear-gradient(45deg, #11998e, #38ef7d); border: none; }
+                .btn-danger { background: linear-gradient(45deg, #eb3349, #f45c43); border: none; }
+                .btn-warning { background: linear-gradient(45deg, #f7971e, #ffd200); border: none; color: #333; }
+                .btn { border-radius: 25px; padding: 10px 25px; font-weight: 500; }
+                h4, h5 { font-weight: 700; text-align: center; margin: 20px 0; color: #fff; }
+                .form-control, .form-select { 
+                    background: rgba(255,255,255,0.1); 
+                    border: 1px solid rgba(255,255,255,0.2);
+                    color: #fff;
+                }
+                .form-control:focus, .form-select:focus { 
+                    background: rgba(255,255,255,0.15);
+                    border-color: #667eea;
+                    color: #fff;
+                }
+                .form-check-input:checked { background-color: #667eea; border-color: #667eea; }
+                label { color: #ccc; }
+                .highlight-box {
+                    background: linear-gradient(45deg, rgba(102,126,234,0.2), rgba(118,75,162,0.2));
+                    border-left: 4px solid #667eea;
+                    padding: 15px;
+                    margin: 10px 0;
+                    border-radius: 0 8px 8px 0;
+                }
+            """)
+        ),
+        
+        # Page title
+        ui.h4("🎯 Variable Selection with EBM Interaction Discovery"),
+        
+        # Configuration Section - DV selection, measures, analyze button
+        ui.div(
+            {"class": "card"},
+            ui.row(
+                ui.column(4,
+                    # Dropdown to select dependent variable
+                    ui.input_select("dv", "Dependent Variable",
+                                   choices=binary_vars,
+                                   selected=binary_vars[0] if binary_vars else None)
+                ),
+                ui.column(4,
+                    # Checkboxes to select which measures to calculate
+                    ui.input_checkbox_group(
+                        "measures", "Measures of Predictive Power",
+                        choices={
+                            'EntropyExplained': 'Entropy Explained',
+                            'InformationValue': 'Information Value',
+                            'OddsRatio': 'Odds Ratio',
+                            'LikelihoodRatio': 'Likelihood Ratio',
+                            'PearsonChiSquare': 'Pearson Chi-Square',
+                            'Gini': 'Gini'
+                        },
+                        selected=['EntropyExplained', 'InformationValue', 'LikelihoodRatio',
+                                 'PearsonChiSquare', 'Gini']
+                    )
+                ),
+                ui.column(4,
+                    # Button to trigger analysis
+                    ui.input_action_button("analyze_btn", "📊 Analyze",
+                                          class_="btn btn-primary btn-lg",
+                                          style="width: 100%; margin-top: 30px;")
+                )
+            )
+        ),
+        
+        # Selection Criteria Section
+        ui.div(
+            {"class": "card"},
+            ui.row(
+                ui.column(3,
+                    # Number of top variables to consider per measure
+                    ui.input_numeric("num_vars", "Number of Variables",
+                                    value=50, min=1, max=500)
+                ),
+                ui.column(3,
+                    # Union vs Intersection selection
+                    ui.input_select("criteria", "Criteria",
+                                   choices={'Union': 'Union (ANY measure)',
+                                           'Intersection': 'Intersection (MULTIPLE measures)'},
+                                   selected='Intersection')
+                ),
+                ui.column(3,
+                    # Degree parameter for Intersection criteria
+                    ui.input_numeric("degree", "Degree (for Intersection)",
+                                    value=2, min=1, max=6)
+                ),
+                ui.column(3,
+                    # Button to apply selection criteria
+                    ui.input_action_button("select_btn", "✅ Select Variables",
+                                          class_="btn btn-success",
+                                          style="width: 100%; margin-top: 30px;")
+                )
+            )
+        ),
+        
+        # EBM Configuration Section
+        ui.div(
+            {"class": "card highlight-box"},
+            ui.h5("🤖 EBM Interaction Discovery"),
+            ui.row(
+                ui.column(3,
+                    ui.input_numeric("max_interactions", "Max Interactions to Detect",
+                                    value=20, min=5, max=50)
+                ),
+                ui.column(3,
+                    ui.input_numeric("top_interactions", "Top Interactions to Include",
+                                    value=10, min=1, max=30)
+                ),
+                ui.column(3,
+                    ui.input_checkbox("auto_add_missed", "Auto-add EBM-missed variables",
+                                     value=True),
+                    ui.input_numeric("max_missed_to_add", "Max missed vars to add (0=ALL)",
+                                    value=0, min=0, max=1000)
+                ),
+                ui.column(3,
+                    ui.input_action_button("ebm_btn", "🔍 Discover Interactions",
+                                          class_="btn btn-warning",
+                                          style="width: 100%; margin-top: 30px;")
+                )
+            )
+        ),
+        
+        # Results Tables - Measures table
+        ui.row(
+            ui.column(12,
+                ui.div(
+                    {"class": "card", "style": "max-height: 400px; overflow-y: auto;"},
+                    ui.h5("📈 Predictive Measures"),
+                    ui.output_data_frame("measures_table")
+                )
+            )
+        ),
+        
+        # Interactions and Missed Variables tables side by side
+        ui.row(
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "max-height: 350px; overflow-y: auto;"},
+                    ui.h5("🔗 EBM Detected Interactions"),
+                    ui.output_data_frame("interactions_table")
+                )
+            ),
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "max-height: 350px; overflow-y: auto;"},
+                    ui.h5("⚠️ Variables Missed by Traditional Selection"),
+                    ui.output_data_frame("missed_table")
+                )
+            )
+        ),
+        
+        # Visualization charts
+        ui.row(
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 400px;"},
+                    output_widget("importance_chart")  # Plotly chart
+                )
+            ),
+            ui.column(6,
+                ui.div(
+                    {"class": "card", "style": "height: 400px;"},
+                    output_widget("interaction_chart")  # Plotly chart
+                )
+            )
+        ),
+        
+        # VIF Table
+        ui.row(
+            ui.column(12,
+                ui.div(
+                    {"class": "card", "style": "max-height: 300px; overflow-y: auto;"},
+                    ui.h5("📊 VIF - Multicollinearity Check"),
+                    ui.output_data_frame("vif_table")
+                )
+            )
+        ),
+        
+        # Summary Statistics
+        ui.div(
+            {"class": "card"},
+            ui.output_ui("summary_stats")
+        ),
+        
+        # Submit Button - generates output and closes the app
+        ui.div(
+            {"class": "card", "style": "text-align: center;"},
+            ui.input_action_button("submit_btn", "🚀 Generate Output & Close",
+                                  class_="btn btn-success btn-lg"),
+        ),
+    )
+    
+    # ==========================================================================
+    # SERVER FUNCTION
+    # ==========================================================================
+    # The server function contains all the reactive logic for the UI
+    
+    def server(input: Inputs, output: Outputs, session: Session):
+        # Reactive values to store intermediate results
+        measures_rv = reactive.Value(pd.DataFrame())      # Calculated measures
+        ebm_report_rv = reactive.Value(None)              # EBM report object
+        selected_vars_rv = reactive.Value([])             # Selected variable names
+        interaction_cols_rv = reactive.Value([])          # Created interaction columns
+        missed_vars_to_add_rv = reactive.Value([])        # Missed vars to auto-add
+        vif_rv = reactive.Value(pd.DataFrame())           # VIF results
+        
+        # ------------------------------------------------------------------
+        # ANALYZE BUTTON - Calculate predictive measures
+        # ------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.analyze_btn)
+        def analyze():
+            dv = input.dv()  # Get selected dependent variable
+            if not input.measures() or not dv:
+                return
+            
+            # Calculate bins internally (equivalent to R's logiBin::getBins)
+            iv_list = [col for col in df.columns if col != dv]
+            bin_result = get_bins(df, dv, iv_list, min_prop=min_prop)
+            bins_df_calc = bin_result.bin
+            var_summary_calc = bin_result.var_summary
+            
+            # Calculate selected measures
+            measures = calculate_all_measures(
+                bins_df_calc,
+                var_summary_calc,
+                list(input.measures())
+            )
+            measures_rv.set(measures)  # Update reactive value
+        
+        # ------------------------------------------------------------------
+        # SELECT BUTTON - Apply selection criteria
+        # ------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.select_btn)
+        def select_variables():
+            measures = measures_rv.get()
+            if measures.empty:
+                return
+            
+            criteria = input.criteria()
+            num_vars = input.num_vars()
+            degree = input.degree() if criteria == 'Intersection' else 1
+            
+            # Apply filtering criteria
+            filtered = filter_variables(measures, criteria, num_vars, degree)
+            measures_rv.set(filtered)
+            
+            # Extract selected variable names
+            selected = filtered[filtered['Selected'] == True]['Variable'].tolist()
+            selected_vars_rv.set(selected)
+        
+        # ------------------------------------------------------------------
+        # EBM BUTTON - Run EBM interaction discovery
+        # ------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.ebm_btn)
+        def run_ebm():
+            dv = input.dv()
+            if not dv or dv not in df.columns:
+                return
+            
+            # Use WOE columns for EBM
+            feature_cols = woe_cols.copy()
+            if not feature_cols:
+                return
+            
+            if not EBM_AVAILABLE:
+                print("EBM not available")
+                return
+            
+            # Train EBM
+            report = train_ebm_for_discovery(
+                df, dv, feature_cols,
+                max_interactions=input.max_interactions()
+            )
+            
+            if report is None:
+                print("EBM training failed")
+                return
+            
+            # Compare with traditional selection
+            selected = selected_vars_rv.get()
+            if selected:
+                missed = compare_selections(selected, report.feature_importances, top_n=50)
+                report.missed_by_traditional = missed
+                
+                # Auto-add missed variables if enabled
+                if input.auto_add_missed():
+                    max_to_add = input.max_missed_to_add()
+                    if max_to_add == 0:
+                        missed_to_add = missed  # 0 means add ALL
+                    else:
+                        missed_to_add = missed[:max_to_add]
+                    missed_vars_to_add_rv.set(missed_to_add)
+            
+            ebm_report_rv.set(report)
+            
+            # Add EBM importance to measures
+            measures = measures_rv.get()
+            if not measures.empty:
+                measures = add_ranks_to_measures(measures)
+                measures = add_ebm_importance_to_measures(measures, report.feature_importances)
+                measures_rv.set(measures)
+            
+            # Create interaction columns
+            if not report.interactions.empty:
+                _, int_cols = create_interaction_columns(
+                    df, report.interactions,
+                    top_n=input.top_interactions()
+                )
+                interaction_cols_rv.set(int_cols)
+            
+            # Calculate VIF for selected + missed + interaction columns
+            all_selected = selected_vars_rv.get().copy()
+            for var in missed_vars_to_add_rv.get():
+                if var not in all_selected:
+                    all_selected.append(var)
+            
+            # Map to WOE columns
+            vif_cols = []
+            for var in all_selected:
+                woe_col = f"WOE_{var}" if not var.startswith('WOE_') else var
+                if woe_col in df.columns:
+                    vif_cols.append(woe_col)
+                elif var in df.columns:
+                    vif_cols.append(var)
+            
+            if vif_cols:
+                vif_result = calculate_vif(df, vif_cols)
+                vif_rv.set(vif_result)
+        
+        # ------------------------------------------------------------------
+        # OUTPUT RENDERERS
+        # ------------------------------------------------------------------
+        
+        @output
+        @render.data_frame
+        def measures_table():
+            """Render the measures DataGrid."""
+            measures = measures_rv.get()
+            if measures.empty:
+                return render.DataGrid(pd.DataFrame({'Message': ['Click "Analyze" to calculate measures']}))
+            return render.DataGrid(measures, selection_mode="rows", height="350px")
+        
+        @output
+        @render.data_frame
+        def interactions_table():
+            """Render the interactions DataGrid."""
+            report = ebm_report_rv.get()
+            if report is None or report.interactions.empty:
+                return render.DataGrid(pd.DataFrame({'Message': ['Click "Discover Interactions" to run EBM']}))
+            return render.DataGrid(
+                report.interactions[['Variable_1', 'Variable_2', 'Magnitude']].head(20),
+                height="300px"
+            )
+        
+        @output
+        @render.data_frame
+        def missed_table():
+            """Render the missed variables DataGrid."""
+            report = ebm_report_rv.get()
+            if report is None or not report.missed_by_traditional:
+                return render.DataGrid(pd.DataFrame({'Message': ['No variables missed or EBM not run yet']}))
+            
+            # Get importance for missed variables
+            missed_df = report.feature_importances[
+                report.feature_importances['Variable'].isin(report.missed_by_traditional)
+            ].copy()
+            missed_df['Status'] = 'Consider Adding'
+            
+            return render.DataGrid(missed_df.head(20), height="300px")
+        
+        @output
+        @render_plotly
+        def importance_chart():
+            """Render the EBM importance bar chart."""
+            report = ebm_report_rv.get()
+            if report is None:
+                return go.Figure().add_annotation(
+                    text="Run EBM to see feature importances",
+                    xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False
+                )
+            
+            top_20 = report.feature_importances.head(20)
+            
+            fig = go.Figure(go.Bar(
+                x=top_20['EBM_Importance'],
+                y=top_20['Variable'],
+                orientation='h',
+                marker=dict(
+                    color=top_20['EBM_Importance'],
+                    colorscale='Viridis'
+                )
+            ))
+            
+            fig.update_layout(
+                title='Top 20 Variables by EBM Importance',
+                xaxis_title='Importance',
+                yaxis_title='Variable',
+                height=350,
+                yaxis=dict(autorange='reversed'),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='white')
+            )
+            
+            return fig
+        
+        @output
+        @render_plotly
+        def interaction_chart():
+            """Render the interaction magnitude bar chart."""
+            report = ebm_report_rv.get()
+            if report is None or report.interactions.empty:
+                return go.Figure().add_annotation(
+                    text="Run EBM to see interactions",
+                    xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False
+                )
+            
+            top_10 = report.interactions.head(10)
+            
+            fig = go.Figure(go.Bar(
+                x=top_10['Magnitude'],
+                y=top_10['Interaction_Name'],
+                orientation='h',
+                marker=dict(
+                    color=top_10['Magnitude'],
+                    colorscale='Plasma'
+                )
+            ))
+            
+            fig.update_layout(
+                title='Top 10 Detected Interactions',
+                xaxis_title='Interaction Magnitude',
+                yaxis_title='Interaction',
+                height=350,
+                yaxis=dict(autorange='reversed'),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='white')
+            )
+            
+            return fig
+        
+        @output
+        @render.data_frame
+        def vif_table():
+            """Render the VIF DataGrid."""
+            vif = vif_rv.get()
+            if vif.empty:
+                return render.DataGrid(pd.DataFrame({'Message': ['Run EBM to calculate VIF']}))
+            return render.DataGrid(vif, height="250px")
+        
+        @output
+        @render.ui
+        def summary_stats():
+            """Render the summary statistics panel."""
+            measures = measures_rv.get()
+            selected = selected_vars_rv.get()
+            int_cols = interaction_cols_rv.get()
+            missed_to_add = missed_vars_to_add_rv.get()
+            vif = vif_rv.get()
+            
+            total_vars = len(measures) if not measures.empty else 0
+            selected_count = len(selected)
+            missed_count = len(missed_to_add)
+            int_count = len(int_cols)
+            total_features = selected_count + missed_count + int_count
+            
+            # Count high VIF variables
+            high_vif_count = 0
+            if not vif.empty and 'VIF' in vif.columns:
+                high_vif_count = len(vif[vif['VIF'] > 5])
+            
+            return ui.div(
+                ui.h5("📊 Selection Summary"),
+                ui.row(
+                    ui.column(2, ui.div(
+                        {"style": "text-align: center; padding: 15px;"},
+                        ui.h3(str(total_vars), style="color: #667eea; margin: 0;"),
+                        ui.p("Total Variables", style="font-size: 12px;")
+                    )),
+                    ui.column(2, ui.div(
+                        {"style": "text-align: center; padding: 15px;"},
+                        ui.h3(str(selected_count), style="color: #38ef7d; margin: 0;"),
+                        ui.p("Selected (Traditional)", style="font-size: 12px;")
+                    )),
+                    ui.column(2, ui.div(
+                        {"style": "text-align: center; padding: 15px;"},
+                        ui.h3(str(missed_count), style="color: #f7971e; margin: 0;"),
+                        ui.p("EBM-Missed Added", style="font-size: 12px;")
+                    )),
+                    ui.column(2, ui.div(
+                        {"style": "text-align: center; padding: 15px;"},
+                        ui.h3(str(int_count), style="color: #ffd200; margin: 0;"),
+                        ui.p("Interaction Terms", style="font-size: 12px;")
+                    )),
+                    ui.column(2, ui.div(
+                        {"style": "text-align: center; padding: 15px;"},
+                        ui.h3(str(total_features), style="color: #eb3349; margin: 0;"),
+                        ui.p("Total for Stepwise", style="font-size: 12px;")
+                    )),
+                    ui.column(2, ui.div(
+                        {"style": "text-align: center; padding: 15px;"},
+                        ui.h3(str(high_vif_count), style="color: #ff6b6b; margin: 0;"),
+                        ui.p("High VIF (>5)", style="font-size: 12px;")
+                    )),
+                )
+            )
+        
+        # ------------------------------------------------------------------
+        # SUBMIT BUTTON - Generate output and close app
+        # ------------------------------------------------------------------
+        @reactive.Effect
+        @reactive.event(input.submit_btn)
+        async def submit():
+            """Handle submit button - prepare outputs and close session."""
+            dv = input.dv()
+            measures = measures_rv.get()
+            selected = selected_vars_rv.get()
+            missed_to_add = missed_vars_to_add_rv.get()
+            report = ebm_report_rv.get()
+            vif = vif_rv.get()
+            
+            # Prepare output columns starting with DV
+            output_cols = [dv] if dv and dv in df.columns else []
+            
+            # Add selected WOE variables
+            for var in selected:
+                woe_col = f"WOE_{var}" if not var.startswith('WOE_') else var
+                if woe_col in df.columns:
+                    output_cols.append(woe_col)
+                elif var in df.columns:
+                    output_cols.append(var)
+            
+            # Add EBM-missed variables (auto-added)
+            for var in missed_to_add:
+                woe_col = var if var.startswith('WOE_') else f"WOE_{var}"
+                if woe_col in df.columns and woe_col not in output_cols:
+                    output_cols.append(woe_col)
+                elif var in df.columns and var not in output_cols:
+                    output_cols.append(var)
+            
+            # Create output DataFrame with interaction columns
+            output_df = df[output_cols].copy() if output_cols else df.copy()
+            
+            # Add interaction columns from EBM
+            if report is not None and not report.interactions.empty:
+                output_df, int_cols = create_interaction_columns(
+                    output_df,
+                    report.interactions,
+                    top_n=input.top_interactions()
+                )
+            
+            # Prepare EBM report DataFrame
+            if report is not None:
+                ebm_report_df = report.interactions.copy()
+                if not ebm_report_df.empty:
+                    ebm_report_df['Status'] = 'Detected Interaction'
+                    ebm_report_df['Included'] = True
+                
+                # Add missed variables section
+                missed_df = pd.DataFrame({
+                    'Variable_1': report.missed_by_traditional,
+                    'Variable_2': ['(single variable)'] * len(report.missed_by_traditional),
+                    'Interaction_Name': report.missed_by_traditional,
+                    'Magnitude': [None] * len(report.missed_by_traditional),
+                    'Status': ['Missed by Traditional'] * len(report.missed_by_traditional),
+                    'Included': [var in missed_to_add for var in report.missed_by_traditional]
+                })
+                if not missed_df.empty:
+                    ebm_report_df = pd.concat([ebm_report_df, missed_df], ignore_index=True)
+            else:
+                ebm_report_df = pd.DataFrame()
+            
+            # Calculate correlation matrix (before VIF removal)
+            numeric_cols = [c for c in output_df.columns if c != dv and pd.api.types.is_numeric_dtype(output_df[c])]
+            corr_matrix = calculate_correlation_matrix(output_df, numeric_cols)
+            
+            # Iteratively remove high VIF variables (default: no removal, threshold=0)
+            remaining_cols, final_vif, removed_cols, _ = remove_high_vif_iteratively(
+                output_df, numeric_cols, vif_threshold=0.0
+            )
+            
+            if removed_cols:
+                final_cols = [dv] + remaining_cols
+                output_df = output_df[final_cols].copy()
+                
+                final_vif['Removed'] = False
+                removed_vif_df = pd.DataFrame({
+                    'Variable': removed_cols,
+                    'VIF': ['>11 (removed)'] * len(removed_cols),
+                    'R_Squared': [None] * len(removed_cols),
+                    'Status': ['REMOVED (VIF>11)'] * len(removed_cols),
+                    'Removed': [True] * len(removed_cols)
+                })
+                final_vif = pd.concat([removed_vif_df, final_vif], ignore_index=True)
+            else:
+                if not final_vif.empty:
+                    final_vif['Removed'] = False
+            
+            # Store results in app_results dictionary
+            app_results['measures'] = measures
+            app_results['selected_data'] = output_df
+            app_results['ebm_report'] = ebm_report_df
+            app_results['correlation_matrix'] = corr_matrix
+            app_results['vif_report'] = final_vif
+            app_results['removed_for_vif'] = removed_cols
+            app_results['completed'] = True
+            
+            # Close the session (ends the Shiny app)
+            await session.close()
+    
+    # Create and return the Shiny app
+    app = App(app_ui, server)
+    app.results = app_results  # Attach results dict to app for external access
+    return app
+
+
+def find_free_port(start_port: int = 8052, max_attempts: int = 50) -> int:
+    """
+    Find an available port starting from start_port.
+    
+    PURPOSE:
+    When running multiple instances of the Shiny app, ports may be occupied.
+    This function finds an available port to bind to.
+    
+    PARAMETERS:
+    - start_port (int): Starting port number (default 8052)
+    - max_attempts (int): Maximum number of ports to try (default 50)
+    
+    RETURNS:
+    int: An available port number
+    """
+    import socket
+    
+    for offset in range(max_attempts):
+        # Pick a random port in the range
+        port = start_port + random.randint(0, RANDOM_PORT_RANGE)
+        try:
+            # Try to bind to the port
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', port))
+                return port  # Port is available
+        except OSError:
+            continue  # Port in use, try another
+    
+    # Fallback: let OS assign a port
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def run_variable_selection(
+    df: pd.DataFrame,
+    port: int = None
+):
+    """
+    Run the Variable Selection application and return results.
+    
+    PURPOSE:
+    Entry point for interactive mode. Creates the Shiny app, finds a port,
+    runs the app, and returns the results after the user closes it.
+    
+    PARAMETERS:
+    - df (pd.DataFrame): The input dataset
+    - port (int, optional): Specific port to use (auto-detected if None)
+    
+    RETURNS:
+    dict: Results dictionary from the app (measures, selected_data, etc.)
+    """
+    # Find a free port if not specified
+    if port is None:
+        port = find_free_port(BASE_PORT)
+    
+    print(f"Starting Shiny app on port {port}")
+    sys.stdout.flush()
+    
+    # Create the Shiny app
+    app = create_variable_selection_app(df)
+    
+    try:
+        # Run the app (blocks until user closes it)
+        app.run(port=port, launch_browser=True)
+    except Exception as e:
+        print(f"Error running Shiny app: {e}")
+        sys.stdout.flush()
+        # Try with a different port
+        try:
+            fallback_port = find_free_port(port + 100)
+            print(f"Retrying on port {fallback_port}")
+            app.run(port=fallback_port, launch_browser=True)
+        except Exception as e2:
+            print(f"Failed on fallback port: {e2}")
+            app.results['completed'] = False
+    
+    # Cleanup
+    gc.collect()
+    sys.stdout.flush()
+    
+    return app.results
