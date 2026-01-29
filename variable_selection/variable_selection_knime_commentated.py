@@ -2210,3 +2210,432 @@ def compare_xgb_selections(
             missed.append(var)
     
     return missed
+
+
+# =============================================================================
+# SECTION 15: UTILITY FUNCTIONS
+# =============================================================================
+# Helper functions for creating interaction columns, calculating correlations,
+# computing VIF, and other utility operations.
+
+def create_interaction_columns(
+    df: pd.DataFrame,
+    interactions: pd.DataFrame,
+    top_n: int = 10
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Create interaction term columns in the DataFrame.
+    
+    PURPOSE:
+    Interactions detected by EBM/XGBoost are represented as new columns
+    computed by multiplying the two interacting variables together.
+    
+    PARAMETERS:
+    - df (pd.DataFrame): The dataset to add interaction columns to
+    - interactions (pd.DataFrame): DataFrame with Variable_1, Variable_2 columns
+    - top_n (int): Number of top interactions to create (default 10)
+    
+    INTERACTION FORMULA:
+    new_col = Variable_1 * Variable_2
+    
+    COLUMN NAMING:
+    "Variable1_x_Variable2" (e.g., "WOE_Age_x_WOE_Income")
+    
+    RETURNS:
+    Tuple[pd.DataFrame, List[str]]: Modified DataFrame and list of new column names
+    """
+    result_df = df.copy()
+    new_cols = []
+    
+    # Return unchanged if no interactions
+    if interactions.empty:
+        return result_df, new_cols
+    
+    # Take only top N interactions
+    top_interactions = interactions.head(top_n)
+    
+    # Create each interaction column
+    for _, row in top_interactions.iterrows():
+        var1 = row['Variable_1']
+        var2 = row['Variable_2']
+        
+        # Check if both variables exist in DataFrame
+        if var1 in df.columns and var2 in df.columns:
+            # Create interaction column name
+            new_col_name = f"{var1}_x_{var2}"
+            # Calculate interaction as product
+            result_df[new_col_name] = df[var1] * df[var2]
+            new_cols.append(new_col_name)
+    
+    return result_df, new_cols
+
+
+def calculate_correlation_matrix(
+    df: pd.DataFrame,
+    cols: List[str]
+) -> pd.DataFrame:
+    """
+    Calculate Pearson correlation matrix for selected columns.
+    
+    PURPOSE:
+    Correlation matrix helps identify redundant variables (high correlation)
+    and understand relationships between selected features.
+    
+    PARAMETERS:
+    - df (pd.DataFrame): The dataset
+    - cols (List[str]): List of column names to include
+    
+    RETURNS:
+    pd.DataFrame: Square correlation matrix (cols x cols)
+    """
+    # Filter to only columns that exist in the DataFrame
+    available_cols = [c for c in cols if c in df.columns]
+    
+    # Need at least 2 columns for correlation
+    if len(available_cols) < 2:
+        return pd.DataFrame()
+    
+    # Calculate Pearson correlation and round to 4 decimals
+    return df[available_cols].corr().round(4)
+
+
+def calculate_vif(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    """
+    Calculate Variance Inflation Factor (VIF) for multicollinearity detection.
+    
+    PURPOSE:
+    VIF measures how much the variance of a regression coefficient is inflated
+    due to multicollinearity. High VIF indicates redundant information.
+    
+    VIF INTERPRETATION:
+    - VIF = 1: No multicollinearity
+    - VIF = 1-5: Low multicollinearity (OK)
+    - VIF = 5-10: Moderate multicollinearity (consider removing)
+    - VIF > 10: High multicollinearity (should remove)
+    - VIF = 999.99: Perfect multicollinearity (can be perfectly predicted)
+    
+    FORMULA:
+    VIF = 1 / (1 - R²) where R² is from regressing the variable on all others
+    
+    PARAMETERS:
+    - df (pd.DataFrame): The dataset
+    - cols (List[str]): List of numeric column names to check
+    
+    RETURNS:
+    pd.DataFrame: VIF report with columns: Variable, VIF, R_Squared, Status, Reason
+    """
+    from sklearn.linear_model import LinearRegression
+    
+    # Filter to numeric columns that exist
+    available_cols = [c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+    
+    if len(available_cols) < 2:
+        return pd.DataFrame({'Variable': [], 'VIF': [], 'Status': [], 'Reason': []})
+    
+    # Prepare data - fill NaN with median
+    X = df[available_cols].copy()
+    X = X.fillna(X.median())
+    
+    # Identify constant columns (zero variance)
+    non_constant_cols = []
+    constant_cols = []
+    for col in available_cols:
+        col_std = X[col].std()
+        if col_std == 0 or pd.isna(col_std) or X[col].nunique() <= 1:
+            constant_cols.append(col)
+        else:
+            non_constant_cols.append(col)
+    
+    if constant_cols:
+        print(f"  [VIF] Found {len(constant_cols)} constant columns (no variance): {constant_cols[:5]}{'...' if len(constant_cols) > 5 else ''}")
+    
+    # Use non-constant columns for VIF calculation
+    unique_cols = non_constant_cols
+    duplicate_cols = []  # Disabled - rely on VIF=999.99 detection instead
+    
+    vif_data = []
+    
+    # Add constant columns with special status
+    for col in constant_cols:
+        vif_data.append({
+            'Variable': col,
+            'VIF': 999.99,
+            'R_Squared': 1.0,
+            'Status': 'CONSTANT - Remove',
+            'Reason': 'Column has no variance'
+        })
+    
+    # Add duplicate columns with special status
+    for dup, orig in duplicate_cols:
+        vif_data.append({
+            'Variable': dup,
+            'VIF': 999.99,
+            'R_Squared': 1.0,
+            'Status': 'DUPLICATE - Remove',
+            'Reason': f'Identical to {orig}'
+        })
+    
+    # Calculate VIF for remaining columns
+    for i, col in enumerate(unique_cols):
+        # Get all other columns as predictors
+        other_cols = [c for c in unique_cols if c != col]
+        
+        if len(other_cols) == 0:
+            vif_data.append({'Variable': col, 'VIF': 1.0, 'R_Squared': 0.0, 'Status': 'OK', 'Reason': ''})
+            continue
+        
+        try:
+            # Fit regression of this column on all others
+            X_others = X[other_cols].values
+            y = X[col].values
+            
+            model = LinearRegression()
+            model.fit(X_others, y)
+            
+            # Calculate R-squared
+            r_squared = model.score(X_others, y)
+            
+            # VIF = 1 / (1 - R²)
+            if r_squared >= 1.0:
+                vif = 999.99  # Perfect multicollinearity
+            else:
+                vif = 1 / (1 - r_squared)
+            
+            # Cap VIF at 999.99 for display
+            VIF_CAP = 999.99
+            if vif > VIF_CAP:
+                vif = VIF_CAP
+                status = 'PERFECT COLLINEAR - Remove'
+                reason = f'VIF exceeded {VIF_CAP} (R²={r_squared:.6f})'
+            elif vif > 10:
+                status = 'HIGH - Remove'
+                reason = 'Strong multicollinearity'
+            elif vif > 5:
+                status = 'MODERATE - Review'
+                reason = 'Moderate multicollinearity'
+            else:
+                status = 'OK'
+                reason = ''
+            
+            vif_data.append({
+                'Variable': col,
+                'VIF': round(vif, 2),
+                'R_Squared': round(r_squared, 4),
+                'Status': status,
+                'Reason': reason
+            })
+            
+        except Exception as e:
+            vif_data.append({
+                'Variable': col,
+                'VIF': None,
+                'R_Squared': None,
+                'Status': 'Error',
+                'Reason': str(e)[:50]
+            })
+    
+    # Create DataFrame and sort by VIF descending
+    vif_df = pd.DataFrame(vif_data)
+    vif_df = vif_df.sort_values('VIF', ascending=False, na_position='last')
+    
+    return vif_df
+
+
+def remove_high_vif_iteratively(
+    df: pd.DataFrame,
+    cols: List[str],
+    vif_threshold: float = 11.0,
+    max_iterations: int = 100
+) -> Tuple[List[str], pd.DataFrame, List[str], List[dict]]:
+    """
+    Iteratively remove variables with VIF >= threshold.
+    
+    PURPOSE:
+    Since removing one high VIF variable changes the VIF of others,
+    we must remove variables one at a time and recalculate.
+    
+    ALGORITHM:
+    1. Remove all constant columns in batch (no variance)
+    2. Calculate VIF for remaining columns
+    3. If highest VIF >= threshold, remove that variable
+    4. Repeat steps 2-3 until no variable exceeds threshold
+    
+    PARAMETERS:
+    - df (pd.DataFrame): The dataset
+    - cols (List[str]): Columns to check
+    - vif_threshold (float): Remove variables with VIF >= this (default 11.0)
+    - max_iterations (int): Maximum removal iterations (default 100)
+    
+    RETURNS:
+    Tuple containing:
+    - remaining_cols: Columns after removal
+    - final_vif: Final VIF DataFrame
+    - removed_cols: List of removed column names
+    - removed_vif_info: List of dicts with removal details
+    """
+    remaining_cols = [c for c in cols if c in df.columns]
+    removed_cols = []
+    removed_vif_info = []
+    
+    # First pass: Remove constant columns in batch
+    vif_df = calculate_vif(df, remaining_cols)
+    
+    if not vif_df.empty and 'Status' in vif_df.columns:
+        # Find constant columns for batch removal
+        batch_remove = vif_df[vif_df['Status'] == 'CONSTANT - Remove']
+        
+        if len(batch_remove) > 0:
+            print(f"  [VIF] Batch removing {len(batch_remove)} constant columns (no variance)")
+            for _, row in batch_remove.iterrows():
+                var = row['Variable']
+                if var in remaining_cols:
+                    remaining_cols.remove(var)
+                    removed_cols.append(var)
+                    removed_vif_info.append({
+                        'Variable': var,
+                        'VIF': float(row['VIF']) if pd.notna(row['VIF']) else 999.99,
+                        'R_Squared': float(row.get('R_Squared', 1.0)) if pd.notna(row.get('R_Squared')) else 1.0,
+                        'Reason': row.get('Reason', row['Status'])
+                    })
+    
+    # Second pass: Iteratively remove high VIF columns one by one
+    for iteration in range(max_iterations):
+        if len(remaining_cols) < 2:
+            break
+        
+        # Calculate VIF for current columns
+        vif_df = calculate_vif(df, remaining_cols)
+        
+        if vif_df.empty:
+            break
+        
+        # Find highest VIF (excluding constant columns)
+        valid_vif = vif_df[vif_df['Status'] != 'CONSTANT - Remove']
+        if valid_vif.empty:
+            break
+        
+        max_vif_row = valid_vif.iloc[0]  # Already sorted descending
+        max_vif = max_vif_row['VIF']
+        max_vif_var = max_vif_row['Variable']
+        
+        # Stop if highest VIF is below threshold
+        if max_vif is None or pd.isna(max_vif) or max_vif < vif_threshold:
+            break
+        
+        # Remove the variable with highest VIF
+        remaining_cols = [c for c in remaining_cols if c != max_vif_var]
+        removed_cols.append(max_vif_var)
+        removed_vif_info.append({
+            'Variable': max_vif_var,
+            'VIF': float(max_vif),
+            'R_Squared': float(max_vif_row.get('R_Squared', 0)) if pd.notna(max_vif_row.get('R_Squared')) else None,
+            'Reason': max_vif_row.get('Reason', max_vif_row['Status'])
+        })
+        print(f"  Removed {max_vif_var} (VIF={max_vif:.2f}) - {max_vif_row.get('Reason', '')}")
+    
+    # Calculate final VIF
+    final_vif = calculate_vif(df, remaining_cols)
+    
+    return remaining_cols, final_vif, removed_cols, removed_vif_info
+
+
+def add_ranks_to_measures(measures_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add rank columns for each measure to help with variable comparison.
+    
+    PURPOSE:
+    Rankings allow easy comparison of variables across different measures.
+    Also calculates average rank and rank agreement (standard deviation).
+    
+    PARAMETERS:
+    - measures_df (pd.DataFrame): DataFrame with calculated measures
+    
+    ADDED COLUMNS:
+    - Entropy_Rank, IV_Rank, OR_Rank, LR_Rank, ChiSq_Rank, Gini_Rank: Individual ranks
+    - Avg_Rank: Average of all ranks
+    - Rank_Agreement: Standard deviation of ranks (lower = more agreement)
+    
+    RETURNS:
+    pd.DataFrame: Input DataFrame with added rank columns
+    """
+    df = measures_df.copy()
+    
+    # Define measure columns and their rank configurations
+    # (rank_column_name, ascending): ascending=False means higher is better
+    measure_rank_configs = {
+        'Entropy': ('Entropy_Rank', False),  # Higher entropy explained = better
+        'Information Value': ('IV_Rank', False),
+        'Odds Ratio': ('OR_Rank', False),
+        'Likelihood Ratio': ('LR_Rank', False),
+        'Chi-Square': ('ChiSq_Rank', False),
+        'Gini': ('Gini_Rank', False)
+    }
+    
+    for col, (rank_col, ascending) in measure_rank_configs.items():
+        if col in df.columns:
+            # Calculate rank (1 = best)
+            # na_option='bottom' puts NaN values at the worst rank
+            df[rank_col] = df[col].rank(ascending=ascending, na_option='bottom')
+    
+    # Calculate average rank across all measures
+    rank_cols = [c for c in df.columns if c.endswith('_Rank')]
+    if rank_cols:
+        df['Avg_Rank'] = df[rank_cols].mean(axis=1).round(2)
+        # Rank agreement: lower std dev = more consistent ranking
+        df['Rank_Agreement'] = df[rank_cols].std(axis=1).round(2)
+    
+    return df
+
+
+def add_ebm_importance_to_measures(
+    measures_df: pd.DataFrame,
+    ebm_importances: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Add EBM importance scores to the measures DataFrame.
+    
+    PURPOSE:
+    Enriches the measures table with EBM importance so users can compare
+    traditional measures with ML-based importance.
+    
+    PARAMETERS:
+    - measures_df (pd.DataFrame): DataFrame with calculated measures
+    - ebm_importances (pd.DataFrame): EBM feature importances
+    
+    ADDED COLUMNS:
+    - EBM_Importance: Raw EBM importance score
+    - EBM_Rank: Rank by EBM importance
+    - Rank_Diff: Absolute difference between EBM rank and average traditional rank
+    - EBM_Disagrees: Flag if rank difference > 20
+    
+    RETURNS:
+    pd.DataFrame: Input DataFrame with EBM columns added
+    """
+    df = measures_df.copy()
+    
+    if ebm_importances.empty:
+        return df
+    
+    # Create mapping from variable name to EBM importance
+    ebm_map = {}
+    for _, row in ebm_importances.iterrows():
+        var = row['Variable']
+        importance = row['EBM_Importance']
+        
+        # Map both with and without WOE_ prefix for flexibility
+        ebm_map[var] = importance
+        if var.startswith('WOE_'):
+            ebm_map[var[4:]] = importance  # Remove WOE_ prefix
+        else:
+            ebm_map[f'WOE_{var}'] = importance  # Add WOE_ prefix
+    
+    # Add EBM columns
+    df['EBM_Importance'] = df['Variable'].map(ebm_map)
+    df['EBM_Rank'] = df['EBM_Importance'].rank(ascending=False, na_option='bottom')
+    
+    # Flag significant disagreements between EBM and traditional selection
+    if 'Avg_Rank' in df.columns:
+        df['Rank_Diff'] = abs(df['EBM_Rank'] - df['Avg_Rank'])
+        df['EBM_Disagrees'] = df['Rank_Diff'] > 20  # Flag if ranks differ by more than 20
+    
+    return df
